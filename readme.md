@@ -157,20 +157,6 @@ This avoids the need for a dedicated WLED fork just to build RaceLink-enabled fi
 
 ---
 
-## If the repository is not public yet
-
-If this repository is not yet available online, there are two practical options:
-
-### Option A: local development
-
-Keep the usermod in your local WLED workspace and reference it locally during development.
-
-### Option B: temporary manual integration
-
-Copy the usermod into the WLED `usermods` directory until the external repository becomes available.
-
----
-
 ## Customizing for your own hardware
 
 If your hardware differs from the provided profiles, you will most likely need to adjust:
