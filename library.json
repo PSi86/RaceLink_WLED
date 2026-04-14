@@ -1,0 +1,9 @@
+{
+  "name": "racelink_wled",
+  "build": {
+    "libArchive": false
+  },
+  "dependencies": {
+    "jgromes/RadioLib" : "^7.4.0"
+  }
+}
