@@ -106,6 +106,8 @@ Before building, make sure you have:
 - a supported ESP32-based target board
 - the matching RaceLink build profile for your hardware
 
+For GitHub-hosted release builds, this repository now also contains a release workflow that checks out the official `wled/WLED` source tree automatically. Maintainers do not need to vendor the WLED codebase into this repository.
+
 ---
 
 ## Quick start
@@ -164,6 +166,48 @@ pio run -e RaceLink_Node_v3_s2_llcc68
 pio run -e RaceLink_Node_v3_s2_llcc68_epaper
 pio run -e RaceLink_Node_v4_s3_llcc68
 ```
+
+---
+
+## GitHub release workflow
+
+The supported path for publishing firmware artifacts is the manual GitHub Actions workflow in `.github/workflows/release.yml`.
+
+That workflow:
+
+- uses this repository as the canonical source for the RaceLink usermod and release version
+- checks out the official `wled/WLED` repository into a temporary build directory
+- defaults to the latest published WLED release unless a specific `wled_ref` is entered in the workflow UI
+- stages the local RaceLink usermod into the checked-out WLED tree
+- stages each shipping `platformio_override.ini` profile and builds only the `[env:...]` targets defined in that profile
+- publishes the resulting firmware artifacts plus a checksum manifest into a GitHub release
+
+### Release versioning
+
+Release versioning follows the same pattern used by `RaceLink_Host` and `RaceLink_RH_Plugin`:
+
+- `version.json` is the canonical source of the RaceLink_WLED release version
+- the workflow accepts an optional `version` override
+- if `version` is empty, the workflow increments the current patch version automatically
+- the workflow commits `version.json`, creates the `v<version>` tag, pushes the selected branch and tag, and then publishes the GitHub release
+
+### Manual release flow
+
+1. Open GitHub Actions and run `.github/workflows/release.yml`.
+2. Set `target_branch` to the branch you want to release from.
+3. Optionally set `version`.
+4. Optionally set `wled_ref`. If it is left empty, the workflow resolves the latest published WLED release automatically.
+5. The workflow builds the shipping RaceLink profiles, uploads the firmware binaries plus a checksum manifest, commits the release metadata, creates the release tag, and publishes the GitHub release.
+
+### Local development vs release builds
+
+Local development builds still follow the normal manual process described earlier in this README: you work against your own WLED checkout and copy a selected profile to `platformio_override.ini`.
+
+GitHub-hosted release builds are different:
+
+- they always start from a fresh official WLED checkout
+- they stage the current RaceLink_WLED branch contents into that checkout
+- they package release-ready binaries for all shipping RaceLink profiles in one release
 
 ---
 
