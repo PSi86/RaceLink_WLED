@@ -1,0 +1,248 @@
+name: Release Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional RaceLink_WLED release version override. Leave empty to auto-increment."
+        required: false
+        default: ""
+        type: string
+      target_branch:
+        description: "Branch to release from"
+        required: true
+        default: "main"
+        type: string
+      wled_ref:
+        description: "Optional WLED tag/ref override. Leave empty to use the latest published WLED release."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out RaceLink_WLED repository
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Set up Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve RaceLink_WLED release version
+        id: release_version
+        run: |
+          version="$(python scripts/bump_release_version.py --version "${{ inputs.version }}")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve WLED source ref
+        id: wled_source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ref="$(python scripts/resolve_wled_release.py --wled-ref "${{ inputs.wled_ref }}" --print ref)"
+          repository="$(python scripts/resolve_wled_release.py --wled-ref "${{ inputs.wled_ref }}" --print repository)"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release version and tag
+        env:
+          EXPECTED_VERSION: ${{ steps.release_version.outputs.version }}
+          EXPECTED_TAG: ${{ steps.release_version.outputs.tag }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(Path("version.json").read_text(encoding="utf-8"))
+          version = str(payload["version"])
+          expected_version = os.environ["EXPECTED_VERSION"]
+          expected_tag = os.environ["EXPECTED_TAG"]
+          derived_tag = f"v{version}"
+
+          if version != expected_version:
+              raise SystemExit(f"Release version mismatch: {version} != {expected_version}")
+          if derived_tag != expected_tag:
+              raise SystemExit(f"Release tag mismatch: {derived_tag} != {expected_tag}")
+          PY
+
+      - name: Fail if tag or release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git ls-remote --tags origin "${{ steps.release_version.outputs.tag }}" | grep -q "${{ steps.release_version.outputs.tag }}"; then
+            echo "Tag ${{ steps.release_version.outputs.tag }} already exists on origin"
+            exit 1
+          fi
+          if gh release view "${{ steps.release_version.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.release_version.outputs.tag }} already exists"
+            exit 1
+          fi
+
+      - name: Run static release tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Check out WLED repository
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: ${{ steps.wled_source.outputs.repository }}
+          ref: ${{ steps.wled_source.outputs.ref }}
+          path: external/WLED
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: external/WLED/.nvmrc
+          cache: npm
+          cache-dependency-path: external/WLED/package-lock.json
+
+      - name: Install WLED build prerequisites
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r external/WLED/requirements.txt
+          npm --prefix external/WLED ci
+
+      - name: Build shipping RaceLink firmware profiles
+        id: build_firmware
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+          WLED_REF: ${{ steps.wled_source.outputs.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          : > dist/built_envs.txt
+          profiles=(
+            "build_profiles/RaceLink_Node_v1_c3_ct62.platformio_override.ini"
+            "build_profiles/RaceLink_Node_v3_s2_llcc68.platformio_override.ini"
+            "build_profiles/RaceLink_Node_v3_s2_llcc68_epaper.platformio_override.ini"
+            "build_profiles/RaceLink_Node_v4_s3_llcc68.platformio_override.ini"
+          )
+
+          for profile in "${profiles[@]}"; do
+            rm -rf external/WLED/build_output/release
+            mkdir -p external/WLED/build_output/release
+
+            mapfile -t envs < <(
+              python scripts/stage_wled_profile.py stage-profile \
+                --repo-root "$GITHUB_WORKSPACE" \
+                --wled-dir "$GITHUB_WORKSPACE/external/WLED" \
+                --profile "$GITHUB_WORKSPACE/$profile"
+            )
+
+            if [ "${#envs[@]}" -eq 0 ]; then
+              echo "Profile $profile did not expose any envs"
+              exit 1
+            fi
+
+            for env_name in "${envs[@]}"; do
+              echo "$env_name" >> dist/built_envs.txt
+            done
+
+            args=()
+            for env_name in "${envs[@]}"; do
+              args+=("-e" "$env_name")
+            done
+
+            python -m platformio run \
+              --project-dir "$GITHUB_WORKSPACE/external/WLED" \
+              "${args[@]}"
+
+            python scripts/stage_wled_profile.py stage-assets \
+              --profile "$GITHUB_WORKSPACE/$profile" \
+              --release-dir "$GITHUB_WORKSPACE/external/WLED/build_output/release" \
+              --dist-dir "$GITHUB_WORKSPACE/dist" \
+              --release-version "$RELEASE_VERSION" \
+              --wled-ref "$WLED_REF"
+          done
+
+          {
+            echo "built_envs<<EOF"
+            sort -u dist/built_envs.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate SHA256 manifest
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          dist = Path("dist")
+          lines = []
+          for path in sorted(dist.glob("RaceLink_WLED-*")):
+              if not path.is_file():
+                  continue
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {path.name}")
+          if not lines:
+              raise SystemExit("No staged release artifacts found in dist/")
+          version = json.loads(Path("version.json").read_text(encoding="utf-8"))["version"]
+          (dist / f"RaceLink_WLED-{version}-sha256.txt").write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Commit release metadata
+        run: |
+          git add version.json
+          if git diff --cached --quiet; then
+            echo "Release metadata did not change"
+          else
+            git commit -m "Release v${{ steps.release_version.outputs.version }}"
+          fi
+
+      - name: Create and push release tag
+        run: |
+          git tag "${{ steps.release_version.outputs.tag }}"
+          git push origin "HEAD:${{ inputs.target_branch }}" --follow-tags
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: racelink_wled_release
+          path: dist/*
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_version.outputs.tag }}
+          target_commitish: ${{ inputs.target_branch }}
+          generate_release_notes: true
+          files: dist/*
+
+      - name: Write workflow summary
+        shell: bash
+        run: |
+          {
+            echo "## Release Summary"
+            echo
+            echo "- RaceLink_WLED version: \`${{ steps.release_version.outputs.version }}\`"
+            echo "- RaceLink_WLED tag: \`${{ steps.release_version.outputs.tag }}\`"
+            echo "- WLED ref: \`${{ steps.wled_source.outputs.ref }}\`"
+            echo "- Built environments:"
+            while IFS= read -r env_name; do
+              echo "  - \`${env_name}\`"
+            done < dist/built_envs.txt
+            echo "- Trigger: \`workflow_dispatch\`"
+          } >> "$GITHUB_STEP_SUMMARY"
