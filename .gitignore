@@ -4,3 +4,8 @@
 .vscode/launch.json
 .vscode/ipch
 *.code-workspace
+
+# Local AI / agent memory — never committed.
+.claude/
+CLAUDE.md
+CLAUDE.local.md
