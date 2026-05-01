@@ -5,6 +5,11 @@
 .vscode/ipch
 *.code-workspace
 
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
 # Local AI / agent memory — never committed.
 .claude/
 CLAUDE.md

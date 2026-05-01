@@ -32,7 +32,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('git tag "${{ steps.release_version.outputs.tag }}"', source)
         self.assertIn('git push origin "HEAD:${{ inputs.target_branch }}" --follow-tags', source)
         self.assertIn('gh release view "${{ steps.release_version.outputs.tag }}"', source)
-        self.assertIn("softprops/action-gh-release@v2", source)
+        self.assertIn("softprops/action-gh-release@v3", source)
         self.assertIn("tag_name: ${{ steps.release_version.outputs.tag }}", source)
 
 
