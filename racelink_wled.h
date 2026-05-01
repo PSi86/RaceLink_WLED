@@ -18,7 +18,47 @@ extern "C" {
   #define DEV_TYPE 10 // WLED Device type for RaceLink
 #endif
 
-using GateCore = RaceLinkProto::P_Control;  // 4B: groupId, flags, presetId, brightness
+// AdvancedFields: parsed body of an OPC_CONTROL packet (variable-length wire
+// format described near P_Control in racelink_proto.h). fieldMask/extMask
+// mirror the wire layout — a bit set means the value was explicitly carried
+// by the most recent CONTROL. After a preset load both masks are set to
+// "all known" because the segment now has a defined value for every field.
+struct AdvancedFields {
+  uint8_t fieldMask = 0;
+  uint8_t extMask   = 0;
+  uint8_t brightness = 0;
+  uint8_t mode = 0;
+  uint8_t speed = 0;
+  uint8_t intensity = 0;
+  uint8_t custom1 = 0;
+  uint8_t custom2 = 0;
+  uint8_t custom3 = 0;      // 0..31 (5 bits)
+  bool    check1 = false;
+  bool    check2 = false;
+  bool    check3 = false;
+  uint8_t palette = 0;
+  uint32_t color1 = 0;      // RGBW (W=0)
+  uint32_t color2 = 0;
+  uint32_t color3 = 0;
+};
+
+// DeviceState: full snapshot of what this device looks like right now.
+// Replaces the old P_Preset-aliased GateCore. Single source of truth for
+// STATUS replies and any future OPC_STATUS_EXT.
+//   - flags is written ONLY by OPC_CONTROL handling (single-writer rule).
+//     OPC_PRESET still carries a flag byte on the wire but it is ignored.
+//   - fields holds the last applied / observed effect parameters; refreshed
+//     from the WLED segment after a preset load and via onStateChange.
+struct DeviceState {
+  uint8_t  groupId    = 0;
+  uint8_t  flags      = 0;
+  uint8_t  presetId   = 0;
+  uint8_t  brightness = 0;
+  AdvancedFields fields{};
+  uint32_t lastUpdateMs = 0;
+};
+
+using GateCore = DeviceState;  // alias kept for existing call sites
 
 // ===================== WLED Sync over RaceLink =====================
 //
@@ -47,13 +87,17 @@ using GateCore = RaceLinkProto::P_Control;  // 4B: groupId, flags, presetId, bri
   #define CALL_MODE_NO_NOTIFY CALL_MODE_DIRECT_CHANGE
 #endif
 
-// CONFIG packet uses the existing 4B P_Control layout, but interprets the fields as:
+// PRESET packet (OPC_PRESET, 4B P_Preset):
 //   groupId    : group selector
-//   flags      : flags bitfield (see below)
-//   presetId   : presetId (1..250)
-//   brightness : brightness (0..255)
+//   flags      : IGNORED by WLED (still on the wire for host compatibility).
+//                Flags are processed only from OPC_CONTROL — single writer rule.
+//                Consequence: PRESET cannot be armed and cannot drive
+//                FORCE_TT0 / FORCE_REAPPLY. Use OPC_CONTROL for those.
+//   presetId   : presetId (1..250) — applied immediately on receipt.
+//   brightness : brightness (0..255) — applied immediately on receipt.
 //
-// Bitfield for CONFIG.flags (stored in P_Control.flags)
+// Bitfield carried by OPC_CONTROL.flags (and also by OPC_PRESET.flags on the
+// wire, where it is ignored). Single host-side definition: flags.py.
 enum GateCfgFlags : uint8_t {
   RACELINK_FLAG_POWER_ON        = 1u << 0,  // desired power state (1=on). If 0 -> bri forced to 0 on start.
   RACELINK_FLAG_ARM_ON_SYNC     = 1u << 1,  // if set: do not apply preset until first SYNC arrives
@@ -165,16 +209,77 @@ private:
   // Config / State
   GateCore current{};  // init in setup()
 
-  // ===== WLED preset-sync state =====
-  struct PendingCfg {
-    bool    armed = false;       // waiting for SYNC to start
-    uint8_t presetId = 0;        // WLED preset ID
-    uint8_t flags = 0;           // GateCfgFlags bitfield
-    uint8_t bri = 0;             // desired brightness (if RACELINK_FLAG_HAS_BRI)
-    uint32_t rxAtMs = 0;         // when CONFIG was received
+  // ===== Pending CONTROL (queued, awaiting SYNC) =====
+  // Only OPC_CONTROL can arm. OPC_PRESET applies immediately and never
+  // produces pending state. The "armed" condition is derived:
+  //   armed == (pending.valid && (current.flags & RACELINK_FLAG_ARM_ON_SYNC))
+  // Cleared by either: SYNC firing (apply + valid=false) or the next CONTROL
+  // arriving with ARM_ON_SYNC=0 (immediate-apply branch sets valid=false).
+  // When the arming CONTROL has OFFSET_MODE set, ``pending.offsetMs`` is
+  // snapshotted from the active offset value at arm time so a later
+  // OPC_OFFSET cannot retroactively shift this queued effect.
+  struct PendingControl {
+    AdvancedFields fields{};
+    uint32_t rxAtMs   = 0;
+    uint16_t offsetMs = 0;
+    bool     valid    = false;
   } pending;
 
-  bool haveControl = false;   // set true after first CONTROL/CONFIG packet
+  // ===== Deferred apply (post-SYNC, awaiting offset deadline) =====
+  // When a SYNC fires with a non-zero pending.offsetMs, the node copies the
+  // queued state here and schedules ``millis() + offsetMs`` as the apply
+  // deadline. ``serviceDeferredApply()`` (called from loop()) replays the
+  // exact apply path the SYNC handler used to run inline.
+  bool           pendingDeferred         = false;
+  uint32_t       pendingDeferredAt       = 0;   // local millis() one-shot deadline
+  uint8_t        pendingDeferredFlags    = 0;   // snapshot of current.flags at SYNC time
+  uint8_t        pendingDeferredBri      = 0;   // briFromPkt captured at SYNC
+  AdvancedFields pendingDeferredFields{};
+  uint16_t       pendingDeferredOffsetMs = 0;   // captured pending.offsetMs; consumed by serviceDeferredApply
+
+  // ===== Persistent per-device phase offset =====
+  // Subtracted from strip.timebase after every SYNC so cyclic effects
+  // (Breathe, Pacifica, anything using strip.now directly in a sin/beat
+  // wave) maintain a stable phase difference vs other groups. Without
+  // this, SYNC re-aligns strip.timebase identically on every device and
+  // direct-time-based effects phase-lock — even when start times were
+  // staggered via offset mode. Updated whenever an effect is applied via
+  // the offset-mode path; reset to 0 when a non-offset effect is applied.
+  int32_t activePhaseOffsetMs = 0;
+
+  // ===== Offset acceptance gate + formula =====
+  // The device runs in one of two states gating which OPC_CONTROL/OPC_PRESET
+  // packets it accepts:
+  //   * mode == NONE  — accept only packets with OFFSET_MODE flag = 0
+  //   * mode != NONE  — accept only packets with OFFSET_MODE flag = 1
+  //
+  // OPC_OFFSET writes the requested formula into ``pendingChange``. The
+  // pending change materialises into ``active`` at the next OPC_CONTROL /
+  // OPC_PRESET that is accepted under the *effective* config (= pending if
+  // valid, else active). For arm-on-sync packets, materialisation defers
+  // to the SYNC that fires the queued effect — the runner exploits this
+  // to send one broadcast OPC_CONTROL to all groups while only the
+  // offset-configured ones accept it.
+  //
+  // ``computeOffsetMs`` evaluates the stored formula against this device's
+  // current.groupId; the result is snapshotted into ``pending.offsetMs``
+  // at arm time (handleControl) so a later OPC_OFFSET cannot retroactively
+  // shift an already-armed effect. The Python mirror lives in
+  // ``racelink/domain/offset_formula.py`` and the contract is locked down
+  // by tests there.
+  struct OffsetConfig {
+    uint8_t  mode        = RaceLinkProto::OFFSET_MODE_NONE;  // OffsetMode
+    int16_t  base_ms     = 0;
+    int16_t  step_ms     = 0;
+    uint8_t  center      = 0;     // VSHAPE
+    uint8_t  cycle       = 1;     // MODULO (1..255; 0 treated as 1)
+    uint16_t explicit_ms = 0;     // EXPLICIT
+  };
+  OffsetConfig active;
+  OffsetConfig pendingChange;
+  bool         pendingChangeValid = false;
+
+  bool haveControl = false;   // set true after first PRESET or CONTROL packet
 
   // last received SYNC phase (for unwrap/filter)
   bool     haveSync = false;
@@ -241,12 +346,80 @@ private:
   } */
   void buildCoreFromCurrent(GateCore& out) { out = current; }  // oder komplett entfernen TODO: noch nötig?
 
-  // Apply CONTROL like original ESPNOW logic
-  void applyControl(const GateCore& in); // legacy immediate apply (kept for compatibility)
+  // current.flags is written ONLY by handleControl (single-writer rule), so
+  // this reads back the most recently received OPC_CONTROL flag byte. Plumbed
+  // for the upcoming scene editor (staggered group offsets via groupDelay /
+  // groupQuotient); currently a no-op in handleSync().
+  bool isOffsetMode() const { return (current.flags & RACELINK_FLAG_OFFSET_MODE) != 0; }
 
-  // New preset-sync handlers
-  void handleControl(const GateCore& cfg);
-  void handleSync(uint32_t ts24, uint8_t briFromPkt);
+  // PRESET handler (OPC_PRESET). Always applies immediately — flags are
+  // ignored (single-writer rule, see DeviceState comment).
+  void handlePreset(const RaceLinkProto::P_Preset& p);
+
+  // SYNC handler. ``syncFlags`` is the fifth body byte (or 0 when the
+  // packet is the legacy 4 B form). Bit 0 = SYNC_FLAG_TRIGGER_ARMED:
+  // when clear, only the timebase is adjusted; when set, any pending
+  // arm-on-sync state materialises. See the P_Sync comment in
+  // racelink_proto.h for the wire-format contract.
+  void handleSync(uint32_t ts24, uint8_t briFromPkt, uint8_t syncFlags);
+
+  // OFFSET handler (OPC_OFFSET, variable-length 2..7 B). Parses the body
+  // (mode discriminator + mode-specific payload) and writes the result
+  // into ``pendingChange``. Filters by groupId: only applies if
+  // body.groupId == 255 or matches our own. Returns false on malformed
+  // bodies (mode unknown / payload short).
+  bool handleOffset(const uint8_t* body, uint8_t bodyLen);
+
+  // Acceptance gate for OPC_CONTROL / OPC_PRESET. Returns true when the
+  // packet's OFFSET_MODE flag matches whether the *effective* config has
+  // mode != NONE (pendingChange if valid, else active). Caller drops the
+  // packet on false.
+  bool offsetGateAccepts(uint8_t packetFlags) const;
+
+  // Materialise pendingChange into ``active``. Called immediately on
+  // accepted, non-armed OPC_CONTROL/OPC_PRESET; deferred to the SYNC
+  // handler when the accepted packet had ARM_ON_SYNC set.
+  void materialisePendingChange();
+
+  // Evaluate the supplied OffsetConfig against this device's groupId,
+  // clamped to [0, 65535]. Used at arm time to snapshot the per-effect
+  // offset so a later OPC_OFFSET cannot shift an already-armed effect.
+  uint16_t computeOffsetMs(const OffsetConfig& cfg) const;
+
+  // Per-loop tick that fires a deferred apply once its deadline elapses.
+  void serviceDeferredApply();
+
+  // Subtracts activePhaseOffsetMs from strip.timebase. ONLY for use right
+  // after a HARD reset of strip.timebase (= desiredTb), where no offset
+  // has yet been baked in. Soft-sync converges naturally and must NOT
+  // call this (would double-subtract).
+  void applyPhaseOffsetAfterHardSync();
+
+  // Switches activePhaseOffsetMs to ``newOffsetMs`` and adjusts
+  // strip.timebase by the delta so the device's effective phase offset
+  // transitions cleanly without waiting for a SYNC. Used by apply paths
+  // (immediate, inline-on-sync, deferred-apply).
+  void setActivePhaseOffsetMs(int32_t newOffsetMs);
+
+  // CONTROL handlers (OPC_CONTROL, variable-length direct parameters).
+  // Returns false on malformed input (under-/overrun, reserved bits we
+  // don't know how to consume, etc.).
+  static bool parseControlBody(const uint8_t* body, uint8_t len,
+                               uint8_t& groupId, uint8_t& flags,
+                               AdvancedFields& out);
+  void handleControl(uint8_t flags, const AdvancedFields& fields);
+  void applyAdvancedFields(uint8_t flags, const AdvancedFields& fields);
+
+  // Snapshot the WLED main segment into current.fields. Called after a preset
+  // load (segment values are now whatever the preset defines, not what was
+  // last commanded) and from onStateChange (UI / JSON API mutations).
+  void refreshFieldsFromSegment();
+
+  // Merge the present-fields of a parsed CONTROL into current.fields.
+  // OR-merges fieldMask/extMask so the snapshot accumulates "everything
+  // we've ever been told", instead of dropping previously-known values
+  // when a partial CONTROL arrives.
+  void mergeFieldsIntoSnapshot(const AdvancedFields& f);
 
   bool handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]);
 };

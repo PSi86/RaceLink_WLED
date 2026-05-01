@@ -121,6 +121,20 @@ void UsermodRaceLink::setup() {
   current.flags      = 0;
   current.presetId   = 11;
   current.brightness = 128;
+
+  // RaceLink: nodes operate in AP+STA mode during firmware updates,
+  // which means WLED's `Network.localIP()` returns the STA address
+  // (not the AP's 4.3.2.1) and the `inSameSubnet` check at
+  // wled_server.cpp:529 rejects AP-side OTA hosts even when they
+  // hold a valid 4.3.2.x DHCP lease. Forcing this off makes /update
+  // use the broader `inLocalSubnet` test which explicitly accepts
+  // 4.3.2.0/24 when apActive. Runs after deserializeConfigFromFS()
+  // so it overrides whatever cfg.json carries — survives factory
+  // resets and persistent operator configs alike. Host-side
+  // OTAService._wled_attempt_unlock is the runtime safety net for
+  // any device flashed before this line was added.
+  // otaSameSubnet = false;
+
 // read MAC from efuse (no WiFi init required)
   // readEfuseMac(); // now in RaceLinkTransport::beginCommon()
 
@@ -152,10 +166,13 @@ void UsermodRaceLink::setup() {
 // ========= Loop =========
 void UsermodRaceLink::loop() {
   if (!radio) return;
-  
+
   // ersetzt bisheriges Flag-/ISR-/onRx()-Handling
   RaceLinkTransport::service(rl, cb);
   serviceStartupIdentifyReplies();
+  // Offset-mode: fire any deferred apply whose deadline has elapsed.
+  // Cheap when nothing is queued (single bool check).
+  serviceDeferredApply();
 
   if (!batteryUM) {
     // Späterer Retry, bis der Battery-UM seine Daten anbietet
@@ -336,13 +353,12 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
     row.add(ebuf);
   }
 
-  // Preset info (optional)
+  // Preset / pending CONTROL info
   {
     char pbuf[32];
-    snprintf(pbuf, sizeof(pbuf), "cur=%u pend=%u %s",
+    snprintf(pbuf, sizeof(pbuf), "cur=%u %s",
              (unsigned)current.presetId,
-             (unsigned)pending.presetId,
-             pending.armed ? "ARMED" : "RUN");
+             pending.valid ? "ARMED" : "RUN");
     JsonArray row = user.createNestedArray(F("Preset"));
     row.add(pbuf);
   }
@@ -429,15 +445,42 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
 }
 
 void UsermodRaceLink::onStateChange(uint8_t mode) {
-  // Mirror current runtime state for STATUS replies / UI.
-  // IMPORTANT: Do NOT map effectCurrent -> presetId (different concept).
+  // Mirror current runtime state for STATUS replies / UI. Picks up changes
+  // from the WLED web UI, JSON API, presets being loaded externally, etc.
   current.brightness = bri;
 
   if (bri > 0) current.flags |= RACELINK_FLAG_POWER_ON;
   else         current.flags &= (uint8_t)~RACELINK_FLAG_POWER_ON;
 
-  // currentPreset is the WLED preset index (0 = none)
+  // currentPreset is the WLED preset index (0 = none).
+  // Do NOT map effectCurrent -> presetId (different concept).
   current.presetId = currentPreset;
+
+  refreshFieldsFromSegment();
+}
+
+// Snapshot the WLED main segment into current.fields. Marks every field
+// as known (fieldMask=0xFF, extMask=0x0F) because the segment now has a
+// defined value for every field we expose.
+void UsermodRaceLink::refreshFieldsFromSegment() {
+  Segment& seg = strip.getMainSegment();
+  current.fields.brightness = bri;
+  current.fields.mode       = seg.mode;
+  current.fields.speed      = seg.speed;
+  current.fields.intensity  = seg.intensity;
+  current.fields.custom1    = seg.custom1;
+  current.fields.custom2    = seg.custom2;
+  current.fields.custom3    = seg.custom3;
+  current.fields.check1     = seg.check1;
+  current.fields.check2     = seg.check2;
+  current.fields.check3     = seg.check3;
+  current.fields.palette    = seg.palette;
+  current.fields.color1     = seg.colors[0];
+  current.fields.color2     = seg.colors[1];
+  current.fields.color3     = seg.colors[2];
+  current.fields.fieldMask  = 0xFF;
+  current.fields.extMask    = 0x0F;
+  current.lastUpdateMs      = millis();
 }
 
 // ========= Radio =========
@@ -625,24 +668,73 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       DEBUG_PRINTLN(F("[RaceLink] SET_GROUP -> applied + ACK"));
     } break;
 
-    case OPC_CONTROL: { // CONTROL: preset config (arm + optional flags/brightness)
-      P_Control p{};
+    case OPC_PRESET: { // PRESET: preset config (arm + optional flags/brightness)
+      P_Preset p{};
       if (!parseBody(buf, (uint8_t)len, p)) break;
       if (!groupMatch(p.groupId)) break;
+      // Offset acceptance gate: drop if OFFSET_MODE flag mismatches the
+      // device's *effective* mode (pending if set, else active). PRESET
+      // applies immediately, so on accept we materialise pending here too.
+      if (!offsetGateAccepts(p.flags)) {
+        DEBUG_PRINTLN(F("[RaceLink] PRESET -> dropped by offset gate"));
+        break;
+      }
+      materialisePendingChange();
 
-      handleControl(p);
+      handlePreset(p);
+      acted = true;
+      DEBUG_PRINTLN(F("[RaceLink] PRESET -> configured"));
+    } break;
+
+    case OPC_CONTROL: { // CONTROL: direct effect-parameter fernsteuerung (variable-length body)
+      // decide_response() skipped the length check (req_len=0). Enforce bounds here.
+      if (bodyLen < 3 || bodyLen > MAX_P_CONTROL) break;
+      const uint8_t* body = buf + sizeof(Header7);
+      uint8_t grp = 0, fl = 0;
+      AdvancedFields f{};
+      if (!parseControlBody(body, bodyLen, grp, fl, f)) break;
+      if (!groupMatch(grp)) break;
+      // Offset acceptance gate: drop if OFFSET_MODE flag mismatches the
+      // effective mode (see racelink_wled.h, P_Offset comment in
+      // racelink_proto.h). For arm-on-sync packets, materialisation defers
+      // to the SYNC handler so a queued effect inherits the new mode/offset
+      // exactly when it fires; for immediate-apply packets we materialise
+      // now (in handleControl) so the new active_mode applies right away.
+      if (!offsetGateAccepts(fl)) {
+        DEBUG_PRINTLN(F("[RaceLink] CONTROL -> dropped by offset gate"));
+        break;
+      }
+
+      handleControl(fl, f);
       acted = true;
       DEBUG_PRINTLN(F("[RaceLink] CONTROL -> configured"));
     } break;
 
-    case OPC_SYNC: { // SYNC pulse (global)
-      P_Sync p{};
-      if (!parseBody(buf, (uint8_t)len, p)) break;
-
-      const uint32_t ts24 = ((uint32_t)p.ts24_0) | ((uint32_t)p.ts24_1 << 8) | ((uint32_t)p.ts24_2 << 16);
-      handleSync(ts24, p.brightness);
+    case OPC_SYNC: { // SYNC pulse (global, variable 4..5 B body)
+      // RULES has req_len=0 for OPC_SYNC; validate length inline.
+      // 4 B = legacy clock-tick (no flags), 5 B = trailing flags byte.
+      // Bit 0 of flags (SYNC_FLAG_TRIGGER_ARMED) gates pending arm-on-sync
+      // materialisation; without it, only the timebase is adjusted.
+      if (bodyLen < 4 || bodyLen > 5) break;
+      const uint8_t* body = buf + sizeof(Header7);
+      const uint32_t ts24 = ((uint32_t)body[0])
+                          | ((uint32_t)body[1] << 8)
+                          | ((uint32_t)body[2] << 16);
+      const uint8_t brightness = body[3];
+      const uint8_t syncFlags  = (bodyLen >= 5) ? body[4] : 0;
+      handleSync(ts24, brightness, syncFlags);
       acted = true;
       //DEBUG_PRINTLN(F("[RaceLink] SYNC -> processed"));
+    } break;
+
+    case OPC_OFFSET: { // variable-length offset config (2..7 B body)
+      // decide_response() skipped the length check (req_len=0). Bounds and
+      // mode-specific payload sizes are validated inside handleOffset().
+      if (bodyLen < 2 || bodyLen > MAX_P_OFFSET) break;
+      const uint8_t* body = buf + sizeof(Header7);
+      if (!handleOffset(body, bodyLen)) break;
+      acted = true;
+      DEBUG_PRINTLN(F("[RaceLink] OFFSET -> pending update"));
     } break;
 
     case OPC_CONFIG: {
@@ -781,7 +873,7 @@ void UsermodRaceLink::sendStatusReplyTo(const uint8_t destLast3[3]) {
     if (macFilterPersist) cfg |= RACELINK_CFG_MAC_FILTER_PERSIST;
     if (apActive) cfg |= RACELINK_CFG_AP_ACTIVE;
     p.configByte = cfg;
-    p.presetId   = currentPreset;
+    p.effectId   = strip.getMainSegment().mode;  // active segment mode (renamed from presetId)
     p.brightness = bri;
   }
   p.vbat_mV  = 0;
@@ -821,64 +913,421 @@ void UsermodRaceLink::sendStatusReplyTo(const uint8_t destLast3[3]) {
   //RaceLinkTransport::scheduleSend(rl, out, n, 50, 2500);
 }
 
-// ========= Apply CONTROL (legacy immediate) =========
-void UsermodRaceLink::applyControl(const GateCore& in) {
-  // Immediate apply (no SYNC). Kept for debug/compat.
-  uint8_t desiredBri = 0;
-  if (in.flags & RACELINK_FLAG_POWER_ON) {
-    if (in.flags & RACELINK_FLAG_HAS_BRI) desiredBri = in.brightness;
-    else desiredBri = bri; // keep current if not specified
-  }
-  bri = desiredBri;
+// ========= PRESET handler (always immediate) =========
+// Most of p.flags is IGNORED here — control flags are processed only by
+// OPC_CONTROL (single-writer rule). PRESET cannot be armed and cannot drive
+// FORCE_TT0 / FORCE_REAPPLY. A pending CONTROL is intentionally NOT cleared:
+// the queued effect-parameter overrides will overlay on top of the loaded
+// preset on the next SYNC. The OFFSET_MODE flag IS honoured because the
+// gate (in handlePacket) already filtered on it; we use it to propagate the
+// per-device phase offset onto strip.timebase.
+void UsermodRaceLink::handlePreset(const RaceLinkProto::P_Preset& p) {
+  haveControl = true;
 
-  applyPreset(in.presetId, CALL_MODE_NO_NOTIFY);
+  applyPreset(p.presetId, CALL_MODE_NO_NOTIFY);
+  bri = p.brightness;
+
+  current.presetId   = p.presetId;
+  current.brightness = p.brightness;
+
+  refreshFieldsFromSegment();
   stateUpdated(CALL_MODE_NO_NOTIFY);
 
-  // Preserve node groupId (CONTROL.groupId is a selector, not a "set group" command)
-  current.flags      = in.flags;
-  current.presetId   = in.presetId;
-  current.brightness = bri;
-  haveControl = true;
+  // Update the per-device phase offset for cyclic effects in the loaded
+  // preset. With OFFSET_MODE flag set, compute against the now-active
+  // config (pendingChange already materialised by the dispatch); without
+  // the flag, reset to 0.
+  const int32_t newOffsetMs = (p.flags & RACELINK_FLAG_OFFSET_MODE)
+                              ? (int32_t)computeOffsetMs(active)
+                              : 0;
+  setActivePhaseOffsetMs(newOffsetMs);
 }
 
-// ========= CONTROL (Preset/Brightness/Flags:ARM, RACELINK_FLAG_FORCE_TT0, etc) handler =========
-void UsermodRaceLink::handleControl(const GateCore& cfg) {
-  pending.presetId = cfg.presetId;
-  pending.flags    = cfg.flags;
-  pending.bri      = cfg.brightness;
-  pending.rxAtMs   = millis();
+// ========= CONTROL parser =========
+// Variable-length body (3..MAX_P_CONTROL). Layout see P_Control in
+// racelink_proto.h. Returns false if the body is shorter than the fieldMask/
+// extMask imply, or if any trailing bytes remain unconsumed (length mismatch).
+// Pre-rename: parseControlAdvBody.
+bool UsermodRaceLink::parseControlBody(const uint8_t* body, uint8_t len,
+                                       uint8_t& groupId, uint8_t& flags,
+                                       AdvancedFields& out) {
+  using namespace RaceLinkProto;
+  if (!body || len < 3) return false;
 
-  haveControl = true;
+  out = AdvancedFields{};
+  uint8_t p = 0;
+  groupId       = body[p++];
+  flags         = body[p++];
+  const uint8_t fm = body[p++];
+  out.fieldMask = fm;
 
-  // Mirror latest config (even before the preset is started)
-  current.flags    = cfg.flags;
-  current.presetId = cfg.presetId;
-  if (cfg.flags & RACELINK_FLAG_HAS_BRI) current.brightness = cfg.brightness;
+  auto readU8 = [&](uint8_t& v) -> bool {
+    if (p >= len) return false;
+    v = body[p++];
+    return true;
+  };
+  auto readRGB = [&](uint32_t& c) -> bool {
+    if ((uint16_t)p + 3 > len) return false;
+    const uint8_t r = body[p++];
+    const uint8_t g = body[p++];
+    const uint8_t b = body[p++];
+    c = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b; // W=0
+    return true;
+  };
 
-  // Recommended path: arm and start on next SYNC
-  pending.armed = (cfg.flags & RACELINK_FLAG_ARM_ON_SYNC) != 0;
-
-  if (!pending.armed) {
-    // Apply immediately (will still be kept in phase by later SYNC pulses)
-    uint16_t prevTT = 0;
-    const bool ttForced = (cfg.flags & RACELINK_FLAG_FORCE_TT0) != 0;
-    if (ttForced) { prevTT = transitionDelay; transitionDelay = 0; }
-
-    applyPreset(cfg.presetId, CALL_MODE_NO_NOTIFY);
-
-    if (!(cfg.flags & RACELINK_FLAG_POWER_ON)) {
-      bri = 0;
-    } else if (cfg.flags & RACELINK_FLAG_HAS_BRI) {
-      bri = cfg.brightness;
-    }
-    stateUpdated(CALL_MODE_NO_NOTIFY);
-
-    if (ttForced) transitionDelay = prevTT;
+  if (fm & RL_CTRL_F_BRIGHTNESS) { if (!readU8(out.brightness)) return false; }
+  if (fm & RL_CTRL_F_MODE)       { if (!readU8(out.mode))       return false; }
+  if (fm & RL_CTRL_F_SPEED)      { if (!readU8(out.speed))      return false; }
+  if (fm & RL_CTRL_F_INTENSITY)  { if (!readU8(out.intensity))  return false; }
+  if (fm & RL_CTRL_F_CUSTOM1)    { if (!readU8(out.custom1))    return false; }
+  if (fm & RL_CTRL_F_CUSTOM2)    { if (!readU8(out.custom2))    return false; }
+  if (fm & RL_CTRL_F_CUSTOM3_CHECKS) {
+    uint8_t v = 0;
+    if (!readU8(v)) return false;
+    out.custom3 = (uint8_t)(v & RL_CTRL_C3_MASK);
+    out.check1  = (v & RL_CTRL_CHECK1_BIT) != 0;
+    out.check2  = (v & RL_CTRL_CHECK2_BIT) != 0;
+    out.check3  = (v & RL_CTRL_CHECK3_BIT) != 0;
   }
+  if (fm & RL_CTRL_F_EXT) {
+    uint8_t em = 0;
+    if (!readU8(em)) return false;
+    out.extMask = em;
+    if (em & RL_CTRL_E_PALETTE) { if (!readU8(out.palette)) return false; }
+    if (em & RL_CTRL_E_COLOR1)  { if (!readRGB(out.color1)) return false; }
+    if (em & RL_CTRL_E_COLOR2)  { if (!readRGB(out.color2)) return false; }
+    if (em & RL_CTRL_E_COLOR3)  { if (!readRGB(out.color3)) return false; }
+  }
+
+  // Length must match exactly -- any trailing byte indicates a malformed
+  // packet or an unknown reserved bit the sender expected us to understand.
+  return (p == len);
+}
+
+// ========= CONTROL apply (segment-level field writes) =========
+// Applies only fields whose bit is set in fieldMask/extMask. Power/brightness
+// are driven by the existing RACELINK_FLAG_* semantics, identical to OPC_PRESET.
+void UsermodRaceLink::applyAdvancedFields(uint8_t flags, const AdvancedFields& f) {
+  using namespace RaceLinkProto;
+
+  uint16_t prevTT = 0;
+  const bool ttForced = (flags & RACELINK_FLAG_FORCE_TT0) != 0;
+  if (ttForced) { prevTT = transitionDelay; transitionDelay = 0; }
+
+  Segment& seg = strip.getMainSegment();
+
+  if (f.fieldMask & RL_CTRL_F_MODE)      seg.setMode(f.mode);
+  if (f.fieldMask & RL_CTRL_F_SPEED)     seg.speed      = f.speed;
+  if (f.fieldMask & RL_CTRL_F_INTENSITY) seg.intensity  = f.intensity;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM1)   seg.custom1    = f.custom1;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM2)   seg.custom2    = f.custom2;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM3_CHECKS) {
+    seg.custom3 = f.custom3;
+    seg.check1  = f.check1;
+    seg.check2  = f.check2;
+    seg.check3  = f.check3;
+  }
+  if (f.extMask & RL_CTRL_E_PALETTE) seg.setPalette(f.palette);
+  if (f.extMask & RL_CTRL_E_COLOR1)  seg.setColor(0, f.color1);
+  if (f.extMask & RL_CTRL_E_COLOR2)  seg.setColor(1, f.color2);
+  if (f.extMask & RL_CTRL_E_COLOR3)  seg.setColor(2, f.color3);
+
+  // Power/brightness: identical semantics to OPC_PRESET path.
+  //  - POWER_ON=0     -> bri forced to 0
+  //  - HAS_BRI + BRI  -> explicit brightness from body
+  //  - otherwise      -> bri left untouched (SYNC may drive it later)
+  if (!(flags & RACELINK_FLAG_POWER_ON)) {
+    bri = 0;
+  } else if ((flags & RACELINK_FLAG_HAS_BRI) && (f.fieldMask & RL_CTRL_F_BRIGHTNESS)) {
+    bri = f.brightness;
+  }
+
+  // FORCE_REAPPLY: re-trigger render even if all writes were no-ops.
+  stateUpdated(CALL_MODE_NO_NOTIFY);
+  if (flags & RACELINK_FLAG_FORCE_REAPPLY) {
+    seg.markForReset();
+    stateUpdated(CALL_MODE_NO_NOTIFY);
+  }
+
+  if (ttForced) transitionDelay = prevTT;
+}
+
+// ========= CONTROL handler (single flag writer; arm-on-sync or immediate) =========
+// OPC_CONTROL is the ONLY writer of current.flags. Behaviour is centralized
+// here so flag-driven semantics (ARM, FORCE_*, OFFSET_MODE) are interpreted
+// in exactly one place.
+void UsermodRaceLink::handleControl(uint8_t flags, const AdvancedFields& f) {
+  haveControl = true;
+  current.flags = flags;
+
+  if (flags & RACELINK_FLAG_ARM_ON_SYNC) {
+    pending.fields = f;
+    pending.rxAtMs = millis();
+    // Evaluate the *effective* config (pending if set, else active) against
+    // this device's groupId and snapshot the result. Using the effective
+    // config lets the user send OPC_OFFSET followed immediately by an
+    // arming OPC_CONTROL — the new formula's per-device value is captured
+    // even though pendingChange has not yet materialised (that happens in
+    // handleSync below). A subsequent OPC_OFFSET cannot retroactively
+    // shift this queued effect — its new value is picked up at the next
+    // arm.
+    if (flags & RACELINK_FLAG_OFFSET_MODE) {
+      const OffsetConfig& effCfg = pendingChangeValid ? pendingChange : active;
+      pending.offsetMs = computeOffsetMs(effCfg);
+    } else {
+      pending.offsetMs = 0;
+    }
+    pending.valid  = true;
+    // A new arm cancels any deferred apply still waiting from a previous
+    // SYNC: the operator chose to re-arm before that deadline elapsed.
+    pendingDeferred = false;
+    return;
+  }
+
+  // Immediate-apply path. Also clears any previously-armed CONTROL — sending
+  // a CONTROL with ARM_ON_SYNC=0 is the documented way to cancel a pending
+  // queued effect. Also cancels a deferred apply for the same reason.
+  // The offset acceptance gate already accepted this packet; the dispatch
+  // switch materialised pendingChange before invoking handleControl, so
+  // ``active`` already reflects the new state.
+  applyAdvancedFields(flags, f);
+  mergeFieldsIntoSnapshot(f);
+
+  if ((flags & RACELINK_FLAG_HAS_BRI) && (f.fieldMask & RaceLinkProto::RL_CTRL_F_BRIGHTNESS)) {
+    current.brightness = f.brightness;
+  }
+
+  // Update the per-device phase offset for cyclic effects. With OFFSET_MODE,
+  // compute this device's offset against the now-active config; without it
+  // (offset mode disabled) reset to 0. Keeps strip.timebase consistent with
+  // the new effect's phase semantics immediately.
+  const int32_t newOffsetMs = (flags & RACELINK_FLAG_OFFSET_MODE)
+                              ? (int32_t)computeOffsetMs(active)
+                              : 0;
+  setActivePhaseOffsetMs(newOffsetMs);
+
+  pending.valid = false;
+  pendingDeferred = false;
+}
+
+// ========= OFFSET handler =========
+// Variable-length parser. Body layout (see racelink_proto.h):
+//   Byte 0: groupId   (0..254 = filter; 255 = broadcast all)
+//   Byte 1: mode      (OffsetMode)
+//   Byte 2..: mode-specific payload
+//
+// Filters on groupId so a broadcast (255) is accepted by every device
+// while a specific group only matches its members. Returns false on
+// malformed bodies; caller treats false as drop.
+//
+// A new OPC_OFFSET overwrites any prior pendingChange — the documented
+// way to cancel a not-yet-materialised activation.
+bool UsermodRaceLink::handleOffset(const uint8_t* body, uint8_t bodyLen) {
+  using namespace RaceLinkProto;
+  if (bodyLen < 2) return false;
+  const uint8_t groupId = body[0];
+  if (groupId != 255 && groupId != current.groupId) return false;
+
+  const uint8_t mode = body[1];
+  OffsetConfig cfg{};
+  cfg.mode = mode;
+
+  switch (mode) {
+    case OFFSET_MODE_NONE:
+      if (bodyLen != 2) return false;
+      break;
+    case OFFSET_MODE_EXPLICIT:
+      if (bodyLen != 4) return false;
+      cfg.explicit_ms = (uint16_t)body[2] | ((uint16_t)body[3] << 8);
+      break;
+    case OFFSET_MODE_LINEAR:
+      if (bodyLen != 6) return false;
+      cfg.base_ms = (int16_t)((uint16_t)body[2] | ((uint16_t)body[3] << 8));
+      cfg.step_ms = (int16_t)((uint16_t)body[4] | ((uint16_t)body[5] << 8));
+      break;
+    case OFFSET_MODE_VSHAPE:
+      if (bodyLen != 7) return false;
+      cfg.base_ms = (int16_t)((uint16_t)body[2] | ((uint16_t)body[3] << 8));
+      cfg.step_ms = (int16_t)((uint16_t)body[4] | ((uint16_t)body[5] << 8));
+      cfg.center  = body[6];
+      break;
+    case OFFSET_MODE_MODULO:
+      if (bodyLen != 7) return false;
+      cfg.base_ms = (int16_t)((uint16_t)body[2] | ((uint16_t)body[3] << 8));
+      cfg.step_ms = (int16_t)((uint16_t)body[4] | ((uint16_t)body[5] << 8));
+      cfg.cycle   = body[6] ? body[6] : 1;
+      break;
+    default:
+      return false;  // unknown mode (forward-compat: drop)
+  }
+
+  pendingChange      = cfg;
+  pendingChangeValid = true;
+  return true;
+}
+
+bool UsermodRaceLink::offsetGateAccepts(uint8_t packetFlags) const {
+  // Strict symmetric gate (2026-04-30 correction):
+  //
+  // The packet's OFFSET_MODE flag MUST match the receiver's effective
+  // offset state. Both directions are strict:
+  //
+  //   F=1 + E=1  -> ACCEPT  (use stored offset)
+  //   F=0 + E=0  -> ACCEPT  (normal immediate apply)
+  //   F=1 + E=0  -> DROP    (use-offset request without configured offset)
+  //   F=0 + E=1  -> DROP    (immediate-apply request to an offset-configured
+  //                          device; the device "stays in offset mode" until
+  //                          OPC_OFFSET(NONE) followed by a materialisation
+  //                          event explicitly transitions it out)
+  //
+  // Design rule: state transitions between "in offset mode" and "not in
+  // offset mode" happen ONLY via OPC_OFFSET. CONTROL/PRESET packets just
+  // dispatch effects within the current state; they never transition the
+  // device's offset configuration. This keeps Strategy A (broadcast OPC_CONTROL
+  // with F=1 lands on exactly the configured subset) functional and gives
+  // the operator a single, explicit transition mechanism.
+  //
+  // Effective config = pending if set, else active. To leave offset mode,
+  // the operator sends OPC_OFFSET(NONE) (which sets pending=NONE so
+  // subsequent F=0 packets accept), then sends a F=0 packet that
+  // materialises pending into active (an OPC_PRESET, or an ARM_ON_SYNC
+  // OPC_CONTROL followed by OPC_SYNC). The host-side scene_runner's
+  // ``offset_group(mode=none)`` container performs both steps in one
+  // operator action.
+  const OffsetConfig& eff = pendingChangeValid ? pendingChange : active;
+  const bool effIsActive = (eff.mode != RaceLinkProto::OFFSET_MODE_NONE);
+  const bool packetWantsActive = (packetFlags & RACELINK_FLAG_OFFSET_MODE) != 0;
+  return packetWantsActive == effIsActive;
+}
+
+void UsermodRaceLink::materialisePendingChange() {
+  if (!pendingChangeValid) return;
+  active = pendingChange;
+  pendingChangeValid = false;
+}
+
+// ========= Formula evaluator =========
+// Mirrors ``racelink/domain/offset_formula.py`` on the host. Both must
+// produce byte-identical results for any (config, group_id) triple.
+uint16_t UsermodRaceLink::computeOffsetMs(const OffsetConfig& cfg) const {
+  using namespace RaceLinkProto;
+  const int32_t gid = (int32_t)current.groupId;
+  int32_t v = 0;
+  switch (cfg.mode) {
+    case OFFSET_MODE_NONE:
+      v = 0;
+      break;
+    case OFFSET_MODE_EXPLICIT:
+      v = (int32_t)cfg.explicit_ms;
+      break;
+    case OFFSET_MODE_LINEAR:
+      v = (int32_t)cfg.base_ms + gid * (int32_t)cfg.step_ms;
+      break;
+    case OFFSET_MODE_VSHAPE: {
+      const int32_t d = gid - (int32_t)cfg.center;
+      const int32_t da = (d < 0) ? -d : d;
+      v = (int32_t)cfg.base_ms + da * (int32_t)cfg.step_ms;
+      break;
+    }
+    case OFFSET_MODE_MODULO: {
+      const int32_t cycle = (cfg.cycle > 0) ? cfg.cycle : 1;
+      v = (int32_t)cfg.base_ms + (gid % cycle) * (int32_t)cfg.step_ms;
+      break;
+    }
+    default:
+      v = 0;
+      break;
+  }
+  if (v < 0) v = 0;
+  if (v > 0xFFFF) v = 0xFFFF;
+  return (uint16_t)v;
+}
+
+// ========= Deferred apply tick =========
+// Replays the same apply sequence handleSync() runs inline when offsetMs == 0.
+// Called from loop() each iteration; cheap when no deferred apply is queued.
+void UsermodRaceLink::serviceDeferredApply() {
+  if (!pendingDeferred) return;
+  // Wrap-safe deadline test: signed difference >= 0 means deadline passed.
+  if ((int32_t)(millis() - pendingDeferredAt) < 0) return;
+
+  applyAdvancedFields(pendingDeferredFlags, pendingDeferredFields);
+
+  if ((pendingDeferredFlags & RACELINK_FLAG_POWER_ON) &&
+      !(pendingDeferredFlags & RACELINK_FLAG_HAS_BRI)) {
+    if (pendingDeferredBri != bri) {
+      bri = pendingDeferredBri;
+      stateUpdated(CALL_MODE_NO_NOTIFY);
+    }
+  }
+
+  mergeFieldsIntoSnapshot(pendingDeferredFields);
+  current.brightness = bri;
+
+  // Promote the captured offset to the device's persistent phase offset.
+  // Adjusts strip.timebase by the delta so direct-time-based effects
+  // (Breathe, Pacifica, ...) immediately get the configured phase shift
+  // without waiting for the next SYNC.
+  setActivePhaseOffsetMs((int32_t)pendingDeferredOffsetMs);
+
+  pendingDeferred = false;
+}
+
+// ========= Phase-offset re-assert (after HARD sync only) =========
+// strip.timebase has just been written to the master-aligned desiredTb
+// (no offset baked in). Subtract activePhaseOffsetMs so this device's
+// strip.now runs that many ms behind master. SOFT sync does NOT call
+// this — it converges naturally because err is computed against the
+// logical timebase (strip.timebase + activePhaseOffsetMs).
+void UsermodRaceLink::applyPhaseOffsetAfterHardSync() {
+  strip.timebase = (uint32_t)((int32_t)strip.timebase - activePhaseOffsetMs);
+}
+
+// ========= Switch active phase offset =========
+// Transitions activePhaseOffsetMs from its current value to ``newOffsetMs``,
+// adjusting strip.timebase by the delta so the device's effective phase
+// shift updates immediately (no need to wait for the next SYNC). Used by
+// apply paths to switch into / out of offset mode and to update the offset
+// when a new effect arrives with a different per-group value.
+void UsermodRaceLink::setActivePhaseOffsetMs(int32_t newOffsetMs) {
+  const int32_t delta = activePhaseOffsetMs - newOffsetMs;
+  strip.timebase = (uint32_t)((int32_t)strip.timebase + delta);
+  activePhaseOffsetMs = newOffsetMs;
+}
+
+void UsermodRaceLink::mergeFieldsIntoSnapshot(const AdvancedFields& f) {
+  using namespace RaceLinkProto;
+  AdvancedFields& snap = current.fields;
+  if (f.fieldMask & RL_CTRL_F_BRIGHTNESS) snap.brightness = f.brightness;
+  if (f.fieldMask & RL_CTRL_F_MODE)       snap.mode       = f.mode;
+  if (f.fieldMask & RL_CTRL_F_SPEED)      snap.speed      = f.speed;
+  if (f.fieldMask & RL_CTRL_F_INTENSITY)  snap.intensity  = f.intensity;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM1)    snap.custom1    = f.custom1;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM2)    snap.custom2    = f.custom2;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM3_CHECKS) {
+    snap.custom3 = f.custom3;
+    snap.check1  = f.check1;
+    snap.check2  = f.check2;
+    snap.check3  = f.check3;
+  }
+  if (f.extMask & RL_CTRL_E_PALETTE) snap.palette = f.palette;
+  if (f.extMask & RL_CTRL_E_COLOR1)  snap.color1  = f.color1;
+  if (f.extMask & RL_CTRL_E_COLOR2)  snap.color2  = f.color2;
+  if (f.extMask & RL_CTRL_E_COLOR3)  snap.color3  = f.color3;
+  snap.fieldMask |= f.fieldMask;
+  snap.extMask   |= f.extMask;
+  current.lastUpdateMs = millis();
 }
 
 // ========= SYNC handler (global, irregular arrival OK) =========
-void UsermodRaceLink::handleSync(uint32_t ts24, uint8_t briFromPkt) {
+// ``syncFlags`` carries SYNC_FLAG_* bits from the 5 B SYNC form (or 0 for
+// the legacy 4 B form). Timebase unwrap + correction is unconditional;
+// pending arm-on-sync materialisation is gated on SYNC_FLAG_TRIGGER_ARMED
+// so an autosync pulse cannot fire armed effects ahead of the scene
+// runner's deliberate sync.
+void UsermodRaceLink::handleSync(uint32_t ts24, uint8_t briFromPkt, uint8_t syncFlags) {
+  using namespace RaceLinkProto;  // for SYNC_FLAG_TRIGGER_ARMED
+  const bool fireArmed = (syncFlags & SYNC_FLAG_TRIGGER_ARMED) != 0;
   const uint32_t nowMs = millis();
 
 // ---- unwrap 24-bit master timestamp (ms) to monotonic 32-bit ----
@@ -906,13 +1355,24 @@ lastSyncLocalMs = nowMs;
   // ---- compute desired WLED timebase (wrap-safe) ----
   const uint32_t desiredTb = (uint32_t)(masterEpochAbsMs - nowMs);
 
-  const int32_t err = (int32_t)(desiredTb - (uint32_t)strip.timebase);
+  // Drift correction is computed against the LOGICAL (master-aligned)
+  // timebase = strip.timebase + activePhaseOffsetMs. Without this, a
+  // non-zero activePhaseOffsetMs would always look like err ==
+  // activePhaseOffsetMs and trigger endless hard-resyncs.
+  const uint32_t logicalTb = (uint32_t)((int32_t)strip.timebase + activePhaseOffsetMs);
+  const int32_t err = (int32_t)(desiredTb - logicalTb);
   lastSyncTbErrMs = err; // debug/info
   const uint32_t aerr = (err < 0) ? (uint32_t)(-err) : (uint32_t)err;
 
-  const bool hard = pending.armed || (aerr > (uint32_t)RACELINK_SYNC_HARD_RESYNC_MS);
+  const bool hard = pending.valid || (aerr > (uint32_t)RACELINK_SYNC_HARD_RESYNC_MS);
   if (hard) {
+    // Hard reset to master-aligned timebase, then re-bake the per-device
+    // phase offset (so cyclic effects keep their phase relative to other
+    // groups). Soft sync below does NOT need this — its step is computed
+    // against logicalTb, so strip.timebase converges to desiredTb -
+    // activePhaseOffsetMs naturally.
     strip.timebase = desiredTb;
+    applyPhaseOffsetAfterHardSync();
   } else {
     int32_t step = err;
     if (step > (int32_t)RACELINK_SYNC_MAX_STEP_MS) step = (int32_t)RACELINK_SYNC_MAX_STEP_MS;
@@ -920,39 +1380,63 @@ lastSyncLocalMs = nowMs;
     strip.timebase = (uint32_t)((int32_t)strip.timebase + step);
   }
 
-  // ---- start pending preset exactly on first SYNC after CONFIG ----
-  if (pending.armed) {
-    uint16_t prevTT = 0;
-    const bool ttForced = (pending.flags & RACELINK_FLAG_FORCE_TT0) != 0;
-    if (ttForced) { prevTT = transitionDelay; transitionDelay = 0; }
+  // ---- apply pending CONTROL on first TRIGGER SYNC after it was armed ----
+  // Gate on SYNC_FLAG_TRIGGER_ARMED: only the deliberate fire from the host
+  // (scene runner / operator) clears `pending.valid`. Autosync pulses skip
+  // this block entirely so they cannot race the deliberate sync.
+  if (fireArmed && pending.valid) {
+    // Materialise any queued offset-mode change *first*: the queued effect
+    // semantically belongs to the new mode. This is the second of two
+    // materialisation sites (the immediate-apply path materialises in the
+    // dispatch switch before invoking handleControl). After this, future
+    // OPC_CONTROL/OPC_PRESET packets see the new activeMode for gate checks.
+    materialisePendingChange();
 
-    const bool needApply = ((pending.flags & RACELINK_FLAG_FORCE_REAPPLY) != 0) || (currentPreset != pending.presetId);
-    if (needApply) {
-      applyPreset(pending.presetId, CALL_MODE_NO_NOTIFY);
+    // Two paths depending on whether the arming CONTROL requested an offset:
+    //   offsetMs == 0 -> apply immediately (legacy fast path; zero overhead)
+    //   offsetMs >  0 -> snapshot state and defer until ``millis() + offsetMs``;
+    //                    the per-loop ``serviceDeferredApply()`` runs the apply.
+    if (pending.offsetMs == 0) {
+      applyAdvancedFields(current.flags, pending.fields);
+
+      // If the queued CONTROL had no brightness but POWER_ON is set, take live
+      // brightness from the SYNC packet.
+      if ((current.flags & RACELINK_FLAG_POWER_ON) &&
+          !(current.flags & RACELINK_FLAG_HAS_BRI)) {
+        if (briFromPkt != bri) {
+          bri = briFromPkt;
+          stateUpdated(CALL_MODE_NO_NOTIFY);
+        }
+      }
+
+      mergeFieldsIntoSnapshot(pending.fields);
+      current.brightness = bri;
+
+      // Group with offset 0 (or no offset mode) → transition to a 0 offset.
+      // Adjusts strip.timebase by the delta so the running effect's phase
+      // is correct immediately, without waiting for the next SYNC.
+      setActivePhaseOffsetMs(0);
+
+      pending.valid = false;
+      return;
     }
 
-    // Brightness: use CONFIG.bri only if RACELINK_FLAG_HAS_BRI is set.
-    // If CONFIG did NOT include brightness, take it from SYNC packet (live brightness).
-    if (!(pending.flags & RACELINK_FLAG_POWER_ON)) {
-      bri = 0;
-    } else if (pending.flags & RACELINK_FLAG_HAS_BRI) {
-      bri = pending.bri;
-    } else {
-      bri = briFromPkt;
-    }
-    stateUpdated(CALL_MODE_NO_NOTIFY);
+    // Deferred path: snapshot everything we need so a subsequent OPC_OFFSET
+    // / OPC_CONTROL packet between now and the deadline does not shift this
+    // queued effect. ``handleControl()`` clears ``pendingDeferred`` if a
+    // brand-new CONTROL re-arms before the deadline.
+    pendingDeferredFlags    = current.flags;
+    pendingDeferredBri      = briFromPkt;
+    pendingDeferredFields   = pending.fields;
+    pendingDeferredAt       = nowMs + pending.offsetMs;
+    pendingDeferredOffsetMs = pending.offsetMs;  // captured for serviceDeferredApply
+    pendingDeferred         = true;
 
-    current.flags      = pending.flags;
-    current.presetId   = pending.presetId;
-    current.brightness = bri;
-
-    pending.armed = false;
-
-    if (ttForced) transitionDelay = prevTT;
+    pending.valid = false;
     return;
   }
 
-  // ---- optional live brightness via SYNC (only if last CONFIG had NO brightness) ----
+  // ---- optional live brightness via SYNC (only if last CONTROL had NO brightness) ----
   if (haveControl && !(current.flags & RACELINK_FLAG_HAS_BRI)) {
     const uint8_t desiredBri = (current.flags & RACELINK_FLAG_POWER_ON) ? briFromPkt : 0;
     if (desiredBri != bri) {
