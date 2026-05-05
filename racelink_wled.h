@@ -87,6 +87,39 @@ using GateCore = DeviceState;  // alias kept for existing call sites
   #define CALL_MODE_NO_NOTIFY CALL_MODE_DIRECT_CHANGE
 #endif
 
+// Master-Quiet-Gate: physical-button gestures (color/brightness) only fire
+// when the device has not received a packet from the paired master for at
+// least this many ms. The triple-tap hotspot recovery ignores this gate.
+#ifndef RACELINK_MASTER_QUIET_MS
+  #define RACELINK_MASTER_QUIET_MS 60000
+#endif
+
+// Hold threshold (= WLED_LONG_PRESS) for the GPIO 0 button.
+#ifndef RACELINK_BTN_LONG_MS
+  #define RACELINK_BTN_LONG_MS 600
+#endif
+
+// Max gap between successive short clicks counted as a multi-tap burst.
+#ifndef RACELINK_BTN_MULTI_WINDOW_MS
+  #define RACELINK_BTN_MULTI_WINDOW_MS 500
+#endif
+
+// Brightness step per fade tick while the button is held.
+#ifndef RACELINK_BTN_BRI_STEP
+  #define RACELINK_BTN_BRI_STEP 4
+#endif
+
+// Minimum interval between brightness fade updates while held.
+#ifndef RACELINK_BTN_FADE_TICK_MS
+  #define RACELINK_BTN_FADE_TICK_MS 30
+#endif
+
+// Idle window for the single-click colour cycle. After this many ms with
+// no short-click, the next click restarts the R→G→B→random sequence at R.
+#ifndef RACELINK_BTN_COLOR_RESET_MS
+  #define RACELINK_BTN_COLOR_RESET_MS 10000
+#endif
+
 // PRESET packet (OPC_PRESET, 4B P_Preset):
 //   groupId    : group selector
 //   flags      : IGNORED by WLED (still on the wire for host compatibility).
@@ -179,6 +212,7 @@ public:
   void addToConfig(JsonObject& root) override;
   bool readFromConfig(JsonObject& root) override;
   void onStateChange(uint8_t mode) override;
+  bool handleButton(uint8_t b) override;
   uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
 
 private:
@@ -295,6 +329,56 @@ private:
   uint8_t masterFull6[6] = {0};
   bool   masterFull6Known = false;
 
+  // Session-only master-contact tracking (NOT persisted) — drives the
+  // physical-button master-quiet gate. lastMasterRxMs is meaningful only
+  // when anyMasterRxSinceBoot is true.
+  //
+  // Why not reuse rl.lastRxAtMs (transport core)? That field is ticked in
+  // the transport before the senderAllowed() filter — it captures any
+  // packet whose receiver matches us, including OPC_DEVICES broadcasts
+  // from a stranger gateway in the next room (different paired master)
+  // or from any gateway during pre-pairing discovery. Using it here would
+  // close the button gate on those packets even though they have no
+  // RaceLink effect on this node. lastMasterRxMs is set only in
+  // learnMasterFromSender() and in handlePacket() guarded by
+  //   masterKnown && same3(h.sender, masterLast3)
+  // so it strictly tracks "our paired master is active right now".
+  //
+  // anyMasterRxSinceBoot disambiguates "never heard from master" from
+  // "60 s elapsed since contact" — without it, lastMasterRxMs == 0 at
+  // boot would falsely register as "master spoke 0 ms ago" for the first
+  // 60 s and lock the button on a fresh power-up.
+  uint32_t lastMasterRxMs = 0;
+  bool     anyMasterRxSinceBoot = false;
+
+  // Custom button state for GPIO 0 (replaces WLED's default short/long/double
+  // mapping). Driven from our own loop() via pollPhysicalButton() so we sample
+  // the pin at full loop rate — WLED's UsermodManager::handleButton() dispatch
+  // is throttled to ~250 ms while strip.isUpdating(), which loses 3-click
+  // bursts and adds noticeable lag to release detection.
+  struct BtnState {
+    bool     down              = false;
+    bool     longHandled       = false; // hold passed RACELINK_BTN_LONG_MS, fade running
+    bool     briDirUp          = true;  // current ping-pong direction; flips on hitting bri limits
+    uint32_t pressedAtMs       = 0;
+    uint32_t lastFadeTickMs    = 0;
+    uint8_t  pendingShortClicks = 0;    // accumulates within RACELINK_BTN_MULTI_WINDOW_MS
+    uint32_t lastShortReleaseMs = 0;
+    // Single-click colour cycle. The fixed primary order is R(0)→G(1)→B(2)
+    // wrapped as a ring buffer; boot picks a random starting index from
+    // {0,1,2} and the click cycle advances `nextPrimaryIdx = (idx+1) % 3`
+    // so all three primaries are guaranteed reachable regardless of where
+    // the boot pick landed (e.g. boot=G → click 1=B → click 2=R → click 3+=
+    // random). primariesShownCount tracks how many primaries have already
+    // been displayed in the current cycle (including the boot colour); once
+    // it reaches 3 the click action switches to random RGB. After
+    // RACELINK_BTN_COLOR_RESET_MS without a short-click the cycle is
+    // re-seeded with a fresh random starting index on the next click.
+    uint8_t  nextPrimaryIdx       = 0;
+    uint8_t  primariesShownCount  = 0;
+    uint32_t lastColorClickMs     = 0;
+  } btn;
+
   // Discovery reply target
   uint8_t targetForReplyLast3[3] = {0};
   uint8_t startupIdentifyStage = 0;
@@ -321,6 +405,27 @@ private:
   void learnMasterFromSender(const uint8_t s3[3], bool persistIfEnabled);
   void persistMasterIfNeeded();
   void clearMaster();
+
+  // Direct-effect visualisations (replace the legacy preset-11 pair feedback
+  // and provide a boot-time fallback when the operator did not configure a
+  // boot preset).
+  void showPairConfirmedEffect();
+  void showBootRandomColor();
+
+  // Colour-cycle helpers. applyCycleColor() writes colPri + the segment for
+  // a given index (0=R, 1=G, 2=B, >=3=random); applyColorCycleStep() handles
+  // the click-driven advance with idle-window reset.
+  void applyCycleColor(uint8_t idx);
+  void applyColorCycleStep(uint32_t now);
+
+  // Master-contact tracking for the button-quiet gate.
+  bool masterContactedRecently() const;
+  void noteMasterRx();
+
+  // Button (GPIO 0) — custom gesture state machine.
+  void pollPhysicalButton(uint32_t now); // own poll, called from loop()
+  void handleRaceLinkButton(uint8_t b, bool pressed, uint32_t now);
+  void serviceButtonFade(uint32_t now);
 
   // Radio helpers
   bool radioInit();

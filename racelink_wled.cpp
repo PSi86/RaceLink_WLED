@@ -10,7 +10,7 @@ static RaceLinkTransport::Callbacks cb{};
 
 // --- Last RX capture (for Info UI) ---
 static uint8_t lastRxRaw[64];
-static volatile uint8_t lastRxLen = 0;        // volatile: wird in anderem Kontext geschrieben
+static volatile uint8_t lastRxLen = 0;        // volatile: written from a different context
 static char lastRxHex[(64 * 3) + 1];          // "FF " * 64 + '\0'
 //static uint32_t lastRxSeenMs = 0;
 
@@ -58,12 +58,12 @@ static inline void captureLastRxPacket(const uint8_t* buf, size_t len) {
 
   size_t n = (len > sizeof(lastRxRaw)) ? sizeof(lastRxRaw) : len;
 
-  // Rohbytes sichern
+  // store raw bytes
   memcpy(lastRxRaw, buf, n);
   lastRxLen = (uint8_t)n;
   //lastRxSeenMs = millis();
 
-  // Ein-Zeilen-Hexstring bauen
+  // build single-line hex string
   char* p = lastRxHex;
   for (size_t i = 0; i < n; ++i) {
     uint8_t b = lastRxRaw[i];
@@ -71,7 +71,7 @@ static inline void captureLastRxPacket(const uint8_t* buf, size_t len) {
     *p++ = HEXLUT[b & 0x0F];
     *p++ = ' ';
   }
-  if (n) *(p - 1) = '\0';  // letztes Leerzeichen durch 0-terminator ersetzen
+  if (n) *(p - 1) = '\0';  // replace trailing space with NUL terminator
   else   *p = '\0';
 }
 
@@ -147,7 +147,7 @@ void UsermodRaceLink::setup() {
 
   cb.onRxPacket = &UsermodRaceLink::on_rx_node;
   //cb.onTxDone   = &UsermodRaceLink::on_tx_done_node;
-  cb.ctx        = this; // sehr wichtig: für handlePacket
+  cb.ctx        = this; // critical: required by handlePacket
 
   DEBUG_PRINTLN(F("[RaceLink] Radio init OK"));
   const uint32_t nowMs = millis();
@@ -161,13 +161,31 @@ void UsermodRaceLink::setup() {
       setDisplayLayout(numberOfSlots);
     #endif
   #endif
+
+  // Boot effect: operator did NOT set a boot preset -> show a random solid
+  // color so it is visible that the device has booted.
+  // When bootPreset != 0, WLED's standard path (beginStrip()/applyPreset)
+  // runs unchanged and our display is suppressed.
+  if (bootPreset == 0) {
+    showBootRandomColor();
+  }
 }
 
 // ========= Loop =========
 void UsermodRaceLink::loop() {
+  // Button: poll the pin directly here so we sample at the full main-loop
+  // rate. Going through WLED's UsermodManager::handleButton() dispatch is
+  // unreliable for fast multi-tap because button.cpp:264 throttles the
+  // dispatcher to one call per ~250 ms while strip.isUpdating(). Our
+  // poll is independent of the radio so triple-tap recovery also works
+  // when radio init failed.
+  const uint32_t nowMs = millis();
+  pollPhysicalButton(nowMs);
+  serviceButtonFade(nowMs);
+
   if (!radio) return;
 
-  // ersetzt bisheriges Flag-/ISR-/onRx()-Handling
+  // replaces the previous flag-/ISR-/onRx() handling
   RaceLinkTransport::service(rl, cb);
   serviceStartupIdentifyReplies();
   // Offset-mode: fire any deferred apply whose deadline has elapsed.
@@ -175,7 +193,7 @@ void UsermodRaceLink::loop() {
   serviceDeferredApply();
 
   if (!batteryUM) {
-    // Späterer Retry, bis der Battery-UM seine Daten anbietet
+    // Retry later until the Battery UM exposes its data
     if (UsermodManager::getUMData(&batteryUM, USERMOD_ID_BATTERY)) {
       DEBUG_PRINTLN(F("[RaceLink] Battery UM data acquired"));
     }
@@ -187,7 +205,7 @@ void UsermodRaceLink::loop() {
 
 // ========= Info (UI) =========
 void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
-  // "u" = Objekt; jede Zeile ist ein Array [labelValue1, labelValue2, ...]
+  // "u" = object; each row is an array [labelValue1, labelValue2, ...]
   JsonObject user = root["u"];
   if (user.isNull()) user = root.createNestedObject("u");
 
@@ -377,12 +395,12 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
     top[F("First Slot (1-8)")] = firstSlot;
   #endif
 
-  // masterLast3: nur persistieren, wenn Persistenz aktiv
+  // masterLast3: only persist when persistence is enabled
   char m3[7+1];
   sprintf(m3, "%02X%02X%02X", masterLast3[0], masterLast3[1], masterLast3[2]);
   top["masterLast3"] = (macFilterPersist && masterKnown) ? String(m3) : String("000000");
 
-  // masterFullMac: nur persistieren, wenn Persistenz aktiv
+  // masterFullMac: only persist when persistence is enabled
   char m6[12+1];
   sprintf(m6, "%02X%02X%02X%02X%02X%02X",
           masterFull6[0], masterFull6[1], masterFull6[2],
@@ -403,7 +421,7 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
   JsonObject top = root["RaceLink"];
   if (top.isNull()) return false;
 
-  // erst Flags lesen
+  // read flags first
   getJsonValue(top["groupId"], current.groupId, 0);
   getJsonValue(top["macFilterEnabled"], macFilterEnabled, true);
   getJsonValue(top["macFilterPersist"], macFilterPersist, false);
@@ -420,7 +438,7 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
     #endif
   #endif
 
-  // Master nur aus Config übernehmen, wenn Persistenz aktiv
+  // only adopt master from config when persistence is enabled
   if (macFilterPersist) {
     String s3 = top["masterLast3"] | "000000";
     if (s3.length() == 6) {
@@ -439,7 +457,7 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
       masterFull6Known = true;
     }
   }
-  // Wenn Persistenz aus: Runtime-Werte NICHT überschreiben
+  // When persistence is off: do NOT overwrite runtime values
 
   return true;
 }
@@ -508,10 +526,10 @@ bool UsermodRaceLink::radioInit() {
   phy.preamble  = RACELINK_PREAMBLE;
   phy.crcOn     = true;
 
-  // C3/HT-CT62-spezifisch:
-  phy.txPowerDbm   = RACELINK_TX_POWER;        // Default überschreiben
-  phy.dio2RfSwitch = 1;                    // SX1262 (HT-CT62) oder auch LLCC68 (DreamLNK)
-  phy.rxBoost      = -1;                   // oder 1/0 je nach Boardtests
+  // C3 / HT-CT62 specific:
+  phy.txPowerDbm   = RACELINK_TX_POWER;        // override default
+  phy.dio2RfSwitch = 1;                    // SX1262 (HT-CT62) or also LLCC68 (DreamLNK)
+  phy.rxBoost      = -1;                   // or 1/0 depending on board tests
 
   radioInitCode = RaceLinkTransport::beginCommon(*radio, rl, phy) ? RADIOLIB_ERR_NONE : -999;
   if (radioInitCode != RADIOLIB_ERR_NONE) { radio = nullptr; return false; }
@@ -522,7 +540,7 @@ bool UsermodRaceLink::radioInit() {
   
   RaceLinkTransport::attachDio1(*radio, rl);
 
-  RaceLinkTransport::setDefaultRxContinuous(rl); // *** WICHTIG: Continuous RX über RL aktivieren ***
+  RaceLinkTransport::setDefaultRxContinuous(rl); // *** IMPORTANT: enable continuous RX via RL ***
 
   return true;
 }
@@ -532,10 +550,10 @@ bool UsermodRaceLink::senderAllowed(const uint8_t s3[3], uint8_t opcode7) {
   if (!macFilterEnabled) return true;
 
   if (!masterKnown) {
-    // solange kein Master gelernt wurde: nur Discovery/Grouping zulassen
+    // while no master has been learned: only allow Discovery/Grouping
     return (opcode7 == OPC_DEVICES || opcode7 == OPC_SET_GROUP);
   }
-  // danach nur noch vom gelernten Master zulassen
+  // after that only accept from the learned master
   return RaceLinkTransport::same3(s3, masterLast3);
 }
 
@@ -543,6 +561,8 @@ void UsermodRaceLink::learnMasterFromSender(const uint8_t s3[3], bool persistIfE
   memcpy(masterLast3, s3, 3);
   masterKnown = true;
   if (persistIfEnabled && macFilterPersist) persistMasterIfNeeded();
+  // Pair event also counts as master contact -> trigger the quiet gate.
+  noteMasterRx();
 }
 
 void UsermodRaceLink::persistMasterIfNeeded() {
@@ -554,6 +574,204 @@ void UsermodRaceLink::persistMasterIfNeeded() {
 void UsermodRaceLink::clearMaster() {
   masterKnown = false;
   memset(masterLast3, 0, 3);
+}
+
+// ========= Direct-effect visualisations =========
+
+void UsermodRaceLink::showPairConfirmedEffect() {
+  // White breathe, persistent. Replaces the old applyPreset(11, ...) — no
+  // preset slot is reserved anymore, operator can freely assign all slots.
+  Segment& seg = strip.getMainSegment();
+  seg.setMode(FX_MODE_BREATH);
+  seg.setColor(0, RGBW32(255, 255, 255, 0));
+  seg.intensity = 128;
+  seg.speed     = 128;
+  bri = 128;
+  stateChanged = true;
+  stateUpdated(CALL_MODE_DIRECT_CHANGE);
+}
+
+void UsermodRaceLink::showBootRandomColor() {
+  // Solid with a random color from {R, G, B}. Only kicks in if the operator
+  // did NOT set a boot preset (bootPreset == 0). Serves as a visual
+  // "device has booted" signal.
+  // esp_random() is the ESP32's hardware RNG (no seed needed).
+  uint8_t pick = (uint8_t)(esp_random() % 3);
+  applyCycleColor(pick);
+  if (bri == 0) bri = briS ? briS : 128;
+  stateChanged = true;
+  stateUpdated(CALL_MODE_INIT);
+  // Seed the ring-buffer cycle: boot already shows one primary color (count=1),
+  // the next click jumps to (pick+1) % 3. That guarantees all three primary
+  // colors have been cycled through after boot+2 clicks before switching to
+  // random — regardless of which color boot picked.
+  btn.primariesShownCount = 1;
+  btn.nextPrimaryIdx      = (uint8_t)((pick + 1) % 3);
+  // lastColorClickMs stays 0: if the operator does not click for >RESET_MS,
+  // the idle reset kicks in and re-seeds the cycle with a new random start.
+}
+
+// ========= Single-click color cycle =========
+
+void UsermodRaceLink::applyCycleColor(uint8_t idx) {
+  if (idx == 0)      { colPri[0] = 255; colPri[1] = 0;   colPri[2] = 0;   colPri[3] = 0; }
+  else if (idx == 1) { colPri[0] = 0;   colPri[1] = 255; colPri[2] = 0;   colPri[3] = 0; }
+  else if (idx == 2) { colPri[0] = 0;   colPri[1] = 0;   colPri[2] = 255; colPri[3] = 0; }
+  else               { setRandomColor(colPri); colPri[3] = 0; }
+
+  Segment& seg = strip.getMainSegment();
+  seg.setMode(FX_MODE_STATIC);
+  seg.setColor(0, RGBW32(colPri[0], colPri[1], colPri[2], 0));
+}
+
+void UsermodRaceLink::applyColorCycleStep(uint32_t now) {
+  // Idle reset: after >RESET_MS without a single click, the cycle is re-seeded
+  // with a new random start index from {0,1,2}. count=0 means "no primary
+  // color shown yet in this cycle round" — so the next three clicks deliver
+  // all three primaries before switching back to random. uint32 subtraction
+  // handles millis() wrap correctly via underflow.
+  if ((now - btn.lastColorClickMs) > RACELINK_BTN_COLOR_RESET_MS) {
+    btn.primariesShownCount = 0;
+    btn.nextPrimaryIdx      = (uint8_t)(esp_random() % 3);
+  }
+
+  if (btn.primariesShownCount < 3) {
+    // Ring-buffer step: show nextPrimaryIdx, advance via (idx+1) % 3.
+    applyCycleColor(btn.nextPrimaryIdx);
+    btn.primariesShownCount++;
+    btn.nextPrimaryIdx = (uint8_t)((btn.nextPrimaryIdx + 1) % 3);
+  } else {
+    // All three primary colors shown in this round -> random.
+    applyCycleColor(3);
+  }
+
+  btn.lastColorClickMs = now;
+  stateChanged = true;
+  colorUpdated(CALL_MODE_BUTTON);
+}
+
+// ========= Master-contact gate =========
+
+bool UsermodRaceLink::masterContactedRecently() const {
+  if (!anyMasterRxSinceBoot) return false;
+  return (millis() - lastMasterRxMs) < RACELINK_MASTER_QUIET_MS;
+}
+
+void UsermodRaceLink::noteMasterRx() {
+  lastMasterRxMs = millis();
+  anyMasterRxSinceBoot = true;
+}
+
+// ========= Custom button (GPIO 0) =========
+
+bool UsermodRaceLink::handleButton(uint8_t b) {
+  // Override hook: only intercept Button 0 (GPIO 0) so WLED's default
+  // mapping (toggleOnOff/setRandomColor/AP-on-5s) does NOT fire. The actual
+  // state machine is driven from loop() via pollPhysicalButton() — this hook
+  // exists solely for suppression.
+  if (b != 0) return false;
+  if (b >= buttons.size()) return false;
+  if (buttons[b].pin < 0) return false;
+  if (buttons[b].type != BTN_TYPE_PUSH) return false;
+  return true; // skip default handling in button.cpp:290+
+}
+
+void UsermodRaceLink::pollPhysicalButton(uint32_t now) {
+  if (buttons.empty()) return;
+  if (buttons[0].pin < 0) return;
+  if (buttons[0].type != BTN_TYPE_PUSH) return;
+
+  bool pressed = (digitalRead(buttons[0].pin) == LOW); // active-low (INPUT_PULLUP)
+  handleRaceLinkButton(0, pressed, now);
+}
+
+void UsermodRaceLink::handleRaceLinkButton(uint8_t /*b*/, bool pressed, uint32_t now) {
+  // -- Rising edge --
+  if (pressed && !btn.down) {
+    btn.down = true;
+    btn.pressedAtMs = now;
+    btn.longHandled = false;
+    return;
+  }
+
+  // -- Held: long-press -> start brightness fade --
+  if (pressed && btn.down) {
+    if (!btn.longHandled && (now - btn.pressedAtMs) >= RACELINK_BTN_LONG_MS) {
+      btn.longHandled = true;
+      btn.briDirUp    = !btn.briDirUp;       // toggle direction on every hold
+      btn.lastFadeTickMs = now;
+      btn.pendingShortClicks = 0;             // hold is explicitly not a multi-tap
+    }
+    return;
+  }
+
+  // -- Falling edge --
+  if (!pressed && btn.down) {
+    btn.down = false;
+    uint32_t dur = now - btn.pressedAtMs;
+
+    if (btn.longHandled) {
+      // Hold ended -> the fade ran during the hold via applyFinalBri()
+      // (without notifications). Call stateUpdated() once now so WS/MQTT/UDP
+      // clients see the final bri value.
+      btn.longHandled = false;
+      stateUpdated(CALL_MODE_BUTTON);
+      return;
+    }
+
+    if (dur < 50) return; // Debounce (matches WLED_DEBOUNCE_THRESHOLD)
+
+    // short click -> accumulate into multi-tap window
+    if (btn.pendingShortClicks < 255) btn.pendingShortClicks++;
+    btn.lastShortReleaseMs = now;
+    return;
+  }
+
+  // -- Idle: multi-tap window is evaluated once the pause >= MULTI_WINDOW --
+  if (!pressed && !btn.down && btn.pendingShortClicks > 0) {
+    if ((now - btn.lastShortReleaseMs) >= RACELINK_BTN_MULTI_WINDOW_MS) {
+      uint8_t clicks = btn.pendingShortClicks;
+      btn.pendingShortClicks = 0;
+
+      if (clicks >= 3) {
+        // Hotspot — ALWAYS, independent of the master-quiet-gate (recovery path).
+        WLED::instance().initAP(true);
+        return;
+      }
+      if (clicks == 1 && !masterContactedRecently()) {
+        // Cycle color through R -> G -> B -> random cycle. Idle reset (>10s
+        // since last click) falls back to R.
+        applyColorCycleStep(now);
+      }
+      // clicks == 2 -> intentionally no action (reserved for future use).
+    }
+  }
+}
+
+void UsermodRaceLink::serviceButtonFade(uint32_t now) {
+  if (!btn.down || !btn.longHandled) return;
+  if (masterContactedRecently()) return; // lock out if the master speaks during a hold
+  if ((now - btn.lastFadeTickMs) < RACELINK_BTN_FADE_TICK_MS) return;
+
+  btn.lastFadeTickMs = now;
+
+  // Ping-pong: invert direction at the limits so the fade keeps running
+  // continuously as long as the button is held.
+  int next = (int)bri;
+  if (btn.briDirUp) {
+    next += RACELINK_BTN_BRI_STEP;
+    if (next >= 255) { next = 255; btn.briDirUp = false; }
+  } else {
+    next -= RACELINK_BTN_BRI_STEP;
+    if (next <= 1)   { next = 1;   btn.briDirUp = true; } // not fully off -> avoid offMode
+  }
+  if ((uint8_t)next == bri) return;
+  bri = (uint8_t)next;
+
+  // applyFinalBri() bypasses WLED's brightness transition entirely (briOld=briT=
+  // bri + applyBri + strip.trigger). Without this, the transition keeps running
+  // for transitionDelay ms after release and the fade feels extremely sluggish.
+  applyFinalBri();
 }
 
 bool UsermodRaceLink::handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]) {
@@ -616,17 +834,24 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
   Header7 h{};
   if (!parseHeader(buf, (uint8_t)len, h)) return;
   debugCounter=1;
-  if (!RaceLinkTransport::receiverMatches(h.receiver, rl.myLast3)) return;  // broadcast ODER exakt meine 3B
+  if (!RaceLinkTransport::receiverMatches(h.receiver, rl.myLast3)) return;  // broadcast OR exactly my 3B
   debugCounter=2;
-  if (type_dir(h.type) != DIR_M2N) return;                       // nur Master->Node Requests hier
+  if (type_dir(h.type) != DIR_M2N) return;                       // only Master->Node requests here
   debugCounter=3;
   const uint8_t opcode7 = type_base(h.type);
 
-  // MAC-Filter (optional wie bisher)
+  // MAC filter (optional, as before)
   if (!senderAllowed(h.sender, opcode7)) return;
   debugCounter=4;
 
-  // Gruppenlogik: für alle Requests, die groupId tragen
+  // Master quiet gate: every accepted packet from the already-paired master
+  // resets the session timer. Pairing events (OPC_SET_GROUP from an unknown
+  // sender) are handled separately in learnMasterFromSender.
+  if (masterKnown && RaceLinkTransport::same3(h.sender, masterLast3)) {
+    noteMasterRx();
+  }
+
+  // Group logic: applies to every request that carries a groupId
   auto groupMatch = [&](uint8_t inGroup) {
     return (inGroup == current.groupId || inGroup == 255);
   };
@@ -654,14 +879,13 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       P_SetGroup p{};
       if (!parseBody(buf, (uint8_t)len, p)) break;
 
-      // wie bisher: group 0 erlaubt Setzen / oder "255" Sonderlogiken…
+      // as before: group 0 allows setting / or "255" special-case logic...
       current.groupId = p.groupId;
 
       learnMasterFromSender(h.sender, /*persistIfEnabled*/true);
 
-      // visuelles Feedback
-      bri = 128;
-      applyPreset(11, CALL_MODE_DIRECT_CHANGE);
+      // visual feedback (direct effect call; no preset slot reserved anymore)
+      showPairConfirmedEffect();
 
       sendAckTo(h.sender, OPC_SET_GROUP, ACK_OK);
       acted = true;
@@ -686,7 +910,7 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       DEBUG_PRINTLN(F("[RaceLink] PRESET -> configured"));
     } break;
 
-    case OPC_CONTROL: { // CONTROL: direct effect-parameter fernsteuerung (variable-length body)
+    case OPC_CONTROL: { // CONTROL: direct effect-parameter remote control (variable-length body)
       // decide_response() skipped the length check (req_len=0). Enforce bounds here.
       if (bodyLen < 3 || bodyLen > MAX_P_CONTROL) break;
       const uint8_t* body = buf + sizeof(Header7);
@@ -812,13 +1036,13 @@ bool UsermodRaceLink::sendIdentifyReplyTo(const uint8_t destLast3[3], bool inclu
 
   P_IdentifyReply p{};
   p.fw = PROTO_VER_MAJOR; // fw = protocol version
-  p.caps            = DEV_TYPE; // caps in dev_type umbenennen
+  p.caps            = DEV_TYPE; // rename caps to dev_type
   p.groupId         = current.groupId;
 
   if (includeFullMac && rl.macReadOK) {
     for (int i=0;i<6;i++) p.mac6[i] = rl.myMac6[i];
   } else {
-    // Falls MAC nicht bekannt, sende 0
+    // If MAC unknown, send 0
     for (int i=0;i<6;i++) p.mac6[i] = 0;
   }
 
@@ -1448,7 +1672,7 @@ lastSyncLocalMs = nowMs;
 }
 
 
-// --- Callback-Brücken als statische Member ---
+// --- Callback bridges as static members ---
 void UsermodRaceLink::on_rx_node(const uint8_t* pkt, uint8_t len,
                                         int16_t rssi, int8_t snr, void* ctx) {
   auto* self = static_cast<UsermodRaceLink*>(ctx);
@@ -1465,7 +1689,7 @@ void UsermodRaceLink::on_rx_node(const uint8_t* pkt, uint8_t len,
 /* void UsermodRaceLink::on_tx_done_node(void* ctx) {
   auto* self = static_cast<UsermodRaceLink*>(ctx);
   if (!self) return;
-  // Optional: Node-spezifische TX-Events
+  // Optional: node-specific TX events
 } */
 
 // ========= MAC helpers =========
