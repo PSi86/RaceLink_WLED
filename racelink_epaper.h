@@ -4,10 +4,17 @@
 /*
   RaceLink ePaper helper (2.9\" BW, GxEPD2)
 
+  All entry points are non-blocking: they queue work for a dedicated FreeRTOS
+  worker task that owns the GxEPD2 display object. The worker runs on core 0
+  (pinned) on ESP32-S3 and time-slices with the Arduino loop on single-core
+  ESP32-S2.
+
   Public API:
     - void epaperInit();
-        Initializes SPI + display and shows a boot screen:
-          "RaceLink Startblock" + WLED_RELEASE_NAME
+        Spawns the worker task and queues a one-shot init request:
+        SPI begin, display.init(), and the boot screen ("RaceLink Startblock"
+        + WLED_RELEASE_NAME). Returns immediately; the panel will show the
+        boot screen ~1 s later.
 
     - void setDisplayLayout(uint8_t numPilots);   // 1..4
         1: single row (nickname large, right full-height inverted bar)
@@ -19,8 +26,9 @@
         Returns false if slot is out of range or exceeds the configured layout.
 
     - void service_epaper();
-        Call this from loop(). It triggers a full refresh 1.5s after the last
-        received update command.
+        Call this from loop(). When the deferred-refresh timer is due, it
+        signals the worker task to render. Returns immediately; the actual
+        render (~1 s on this panel) happens off the main loop.
 
   Notes:
     - SPI MOSI/SCK are configurable via build flags:
