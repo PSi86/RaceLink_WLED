@@ -10,11 +10,15 @@
   ESP32-S2.
 
   Public API:
-    - void epaperInit();
-        Spawns the worker task and queues a one-shot init request:
-        SPI begin, display.init(), and the boot screen ("RaceLink Startblock"
-        + WLED_RELEASE_NAME). Returns immediately; the panel will show the
-        boot screen ~1 s later.
+    - void epaperInit(int8_t mosi, int8_t sck, int8_t miso,
+                      int8_t cs,   int8_t dc,  int8_t rst, int8_t busy);
+        Stores the pin assignments for the dedicated HSPI bus and the GxEPD2
+        control pins, then spawns the worker task and queues a one-shot init
+        request: SPI begin, display.init(), and the boot screen ("RaceLink
+        Startblock" + WLED_RELEASE_NAME). Returns immediately; the panel will
+        show the boot screen ~1 s later.
+
+        miso may be -1 if the panel doesn't expose MISO (typical for e-paper).
 
     - void setDisplayLayout(uint8_t numPilots);   // 1..4
         1: single row (nickname large, right full-height inverted bar)
@@ -31,21 +35,18 @@
         render (~1 s on this panel) happens off the main loop.
 
   Notes:
-    - SPI MOSI/SCK are configurable via build flags:
-        -D RACELINK_EPAPER_SPI_MOSI=11
-        -D RACELINK_EPAPER_SPI_SCK=12
-      (MISO is typically unused; default -1)
-
-    - Display control pins are configurable too:
-        -D RACELINK_EPAPER_CS=...
-        -D RACELINK_EPAPER_DC=...
-        -D RACELINK_EPAPER_RST=...
-        -D RACELINK_EPAPER_BUSY=...
+    - Pin assignments are runtime parameters now. The previous compile-time
+      defines (RACELINK_EPAPER_MOSI / SCK / MISO / CS / DC / RST / BUSY) are
+      still recognized in racelink_wled.h as *defaults* per build profile —
+      they seed UsermodRaceLink::epd* members which are the actual values
+      passed to this function. Operators can override the defaults via the
+      WLED settings UI (changes require a reboot).
 
     - WLED_RELEASE_NAME is printed on the start screen (fallback \"WLED\").
 */
 
-void epaperInit();
+void epaperInit(int8_t mosi, int8_t sck, int8_t miso,
+                int8_t cs,   int8_t dc,  int8_t rst, int8_t busy);
 void setDisplayLayout(uint8_t numPilots);
 bool setPilotSlotData(const char* nickname, const char* raceLabel, uint8_t slot);
 void service_epaper();

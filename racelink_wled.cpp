@@ -1,5 +1,6 @@
 #include "racelink_wled.h"
 //#include <WiFi.h>  // fallback for WiFi.macAddress()
+#include "pin_manager.h"
 
 #ifdef RACELINK_EPAPER
 #include "racelink_epaper.h"
@@ -116,6 +117,13 @@ static UsermodRaceLink* s_gateSelf = nullptr;
 
 // ========= Setup =========
 void UsermodRaceLink::setup() {
+  // Re-apply fleet-uniformity defaults (FPS, ABL, gamma) before anything else
+  // runs. By now WLED has deserialised cfg.json, so the affected globals carry
+  // whatever the operator's saved config said — possibly drifted from the
+  // fleet's expected values. RaceLink is the authoritative source for these
+  // settings, not per-device cfg.json.
+  applyRaceLinkDefaults();
+
   // init defaults for current gate state
   current.groupId    = 0;
   current.flags      = 0;
@@ -156,10 +164,27 @@ void UsermodRaceLink::setup() {
   startupIdentifyAtMs[1] = nowMs + STARTUP_IDENTIFY_SECOND_DELAY_MS;
   
   #ifdef RACELINK_EPAPER
-    epaperInit();
-    #if DEV_TYPE == 50
-      setDisplayLayout(numberOfSlots);
-    #endif
+    {
+      const PinManagerPinType epdPins[] = {
+        { epdSck,  true  },
+        { epdMosi, true  },
+        { epdMiso, false },
+        { epdCs,   true  },
+        { epdDc,   true  },
+        { epdRst,  true  },
+        { epdBusy, false },
+      };
+      if (PinManager::allocateMultiplePins(epdPins,
+                                           sizeof(epdPins) / sizeof(epdPins[0]),
+                                           PinOwner::UM_Unspecified)) {
+        epaperInit(epdMosi, epdSck, epdMiso, epdCs, epdDc, epdRst, epdBusy);
+        #if DEV_TYPE == 50
+          setDisplayLayout(numberOfSlots);
+        #endif
+      } else {
+        DEBUG_PRINTLN(F("[RaceLink] ePaper PinManager allocation failed — display disabled"));
+      }
+    }
   #endif
 
   // Boot effect: operator did NOT set a boot preset -> show a random solid
@@ -415,11 +440,62 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
   l["cr"]   = RACELINK_CR;
   l["sync"] = RACELINK_SYNC_WORD;
   l["txp"]  = RACELINK_TX_POWER;
+
+  // RaceLink radio control pins. Defaults match the build profile (see
+  // RACELINK_PIN_* macros in racelink_wled.h). Saved values are loaded into
+  // the corresponding pin* members during readFromConfig() and applied when
+  // radioInit() runs at the next boot.
+  JsonObject pins = top.createNestedObject("pins");
+  pins[F("SCK")]  = pinSck;
+  pins[F("MISO")] = pinMiso;
+  pins[F("MOSI")] = pinMosi;
+  pins[F("NSS")]  = pinNss;
+  pins[F("DIO1")] = pinDio1;
+  pins[F("BUSY")] = pinBusy;
+  pins[F("RST")]  = pinRst;
+
+  #ifdef RACELINK_EPAPER
+    JsonObject ep = top.createNestedObject("epaper_pins");
+    ep[F("SCK")]  = epdSck;
+    ep[F("MISO")] = epdMiso;
+    ep[F("MOSI")] = epdMosi;
+    ep[F("CS")]   = epdCs;
+    ep[F("DC")]   = epdDc;
+    ep[F("RST")]  = epdRst;
+    ep[F("BUSY")] = epdBusy;
+  #endif
+
+  // RaceLink-authoritative overrides (settable via OPC_CONFIG 0x05..0x0A or
+  // directly in this WebUI). All six slots are emitted unconditionally so
+  // the operator always sees every override row in WLED Settings → Usermods,
+  // and so OPC_GET_CONFIG can always round-trip. Slot values are pushed to
+  // the live WLED globals by applyRaceLinkDefaults() — readFromConfig()
+  // calls it after every Save so changes are live without a reboot.
+  // Long descriptive keys: WLED's generic Settings → Usermods UI renders
+  // JSON keys 1:1 as field labels, so the keys ARE the labels. Segment
+  // fields are flat with a "Segment N " prefix because WLED does not
+  // render parent-object names as section headers — nesting would just
+  // produce four identical "Start LED"/"Stop LED" rows in the UI.
+  JsonObject ov = top.createNestedObject(F("overrides"));
+  ov[F("Target FPS")]               = overrides.fps;
+  ov[F("ABL Max mA")]               = overrides.ablMaxMa;
+  ov[F("Default Brightness")]       = overrides.briS;
+  ov[F("Transition Duration (ms)")] = overrides.transitionMs;
+  ov[F("Segment 0 Start LED")]      = overrides.seg0Start;
+  ov[F("Segment 0 Stop LED")]       = overrides.seg0Stop;
+  ov[F("Segment 1 Start LED")]      = overrides.seg1Start;
+  ov[F("Segment 1 Stop LED")]       = overrides.seg1Stop;
 }
 
 bool UsermodRaceLink::readFromConfig(JsonObject& root) {
   JsonObject top = root["RaceLink"];
   if (top.isNull()) return false;
+
+  // Snapshot before firstReadFromConfig is cleared further down. Determines
+  // whether we should push the freshly-read overrides into live WLED globals
+  // at the tail of this function (WebUI Save path) or skip it because
+  // setup() will call applyRaceLinkDefaults() in a moment anyway (boot path).
+  const bool wasFirstCall = firstReadFromConfig;
 
   // read flags first
   getJsonValue(top["groupId"], current.groupId, 0);
@@ -458,6 +534,85 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
     }
   }
   // When persistence is off: do NOT overwrite runtime values
+
+  // RaceLink radio pins. Capture old values to detect a UI change so we can
+  // request a reboot (SPI re-init at runtime is not supported by design).
+  // On the very first call (boot-time deserialize), suppress the reboot —
+  // the values being read ARE the boot-time values.
+  const int8_t oldSck  = pinSck;
+  const int8_t oldMiso = pinMiso;
+  const int8_t oldMosi = pinMosi;
+  const int8_t oldNss  = pinNss;
+  const int8_t oldDio1 = pinDio1;
+  const int8_t oldBusy = pinBusy;
+  const int8_t oldRst  = pinRst;
+  {
+    JsonObject pins = top["pins"];
+    getJsonValue(pins[F("SCK")],  pinSck,  RACELINK_PIN_SCK);
+    getJsonValue(pins[F("MISO")], pinMiso, RACELINK_PIN_MISO);
+    getJsonValue(pins[F("MOSI")], pinMosi, RACELINK_PIN_MOSI);
+    getJsonValue(pins[F("NSS")],  pinNss,  RACELINK_PIN_NSS);
+    getJsonValue(pins[F("DIO1")], pinDio1, RACELINK_PIN_DIO1);
+    getJsonValue(pins[F("BUSY")], pinBusy, RACELINK_PIN_BUSY);
+    getJsonValue(pins[F("RST")],  pinRst,  RACELINK_PIN_RST);
+  }
+  bool pinsChanged = (oldSck  != pinSck)  || (oldMiso != pinMiso) ||
+                     (oldMosi != pinMosi) || (oldNss  != pinNss)  ||
+                     (oldDio1 != pinDio1) || (oldBusy != pinBusy) ||
+                     (oldRst  != pinRst);
+
+  #ifdef RACELINK_EPAPER
+    const int8_t oldEpdSck  = epdSck;
+    const int8_t oldEpdMiso = epdMiso;
+    const int8_t oldEpdMosi = epdMosi;
+    const int8_t oldEpdCs   = epdCs;
+    const int8_t oldEpdDc   = epdDc;
+    const int8_t oldEpdRst  = epdRst;
+    const int8_t oldEpdBusy = epdBusy;
+    {
+      JsonObject ep = top["epaper_pins"];
+      getJsonValue(ep[F("SCK")],  epdSck,  RACELINK_EPAPER_SCK);
+      getJsonValue(ep[F("MISO")], epdMiso, RACELINK_EPAPER_MISO);
+      getJsonValue(ep[F("MOSI")], epdMosi, RACELINK_EPAPER_MOSI);
+      getJsonValue(ep[F("CS")],   epdCs,   RACELINK_EPAPER_CS);
+      getJsonValue(ep[F("DC")],   epdDc,   RACELINK_EPAPER_DC);
+      getJsonValue(ep[F("RST")],  epdRst,  RACELINK_EPAPER_RST);
+      getJsonValue(ep[F("BUSY")], epdBusy, RACELINK_EPAPER_BUSY);
+    }
+    pinsChanged = pinsChanged ||
+                  (oldEpdSck  != epdSck)  || (oldEpdMiso != epdMiso) ||
+                  (oldEpdMosi != epdMosi) || (oldEpdCs   != epdCs)   ||
+                  (oldEpdDc   != epdDc)   || (oldEpdRst  != epdRst)  ||
+                  (oldEpdBusy != epdBusy);
+  #endif
+
+  if (pinsChanged && !firstReadFromConfig) {
+    DEBUG_PRINTLN(F("[RaceLink] Pin config changed — rebooting to apply"));
+    doReboot = true;
+  }
+  firstReadFromConfig = false;
+
+  // RaceLink-authoritative overrides. Slots are always present in cfg.json
+  // (addToConfig writes them unconditionally); a missing key on first boot
+  // after upgrade falls back to the RACELINK_DEFAULT_* compile constant via
+  // the getJsonValue default arg.
+  JsonObject ov = top["overrides"];
+  getJsonValue(ov[F("Target FPS")],               overrides.fps,          (uint8_t)RACELINK_DEFAULT_FPS);
+  getJsonValue(ov[F("ABL Max mA")],               overrides.ablMaxMa,     (uint16_t)RACELINK_DEFAULT_ABL_MAX_MA);
+  getJsonValue(ov[F("Default Brightness")],       overrides.briS,         (uint8_t)RACELINK_DEFAULT_BRIS);
+  getJsonValue(ov[F("Transition Duration (ms)")], overrides.transitionMs, (uint16_t)RACELINK_DEFAULT_TRANSITION_MS);
+  getJsonValue(ov[F("Segment 0 Start LED")], overrides.seg0Start, (uint16_t)RACELINK_DEFAULT_SEG0_START);
+  getJsonValue(ov[F("Segment 0 Stop LED")],  overrides.seg0Stop,  (uint16_t)RACELINK_DEFAULT_SEG0_STOP);
+  getJsonValue(ov[F("Segment 1 Start LED")], overrides.seg1Start, (uint16_t)RACELINK_DEFAULT_SEG1_START);
+  getJsonValue(ov[F("Segment 1 Stop LED")],  overrides.seg1Stop,  (uint16_t)RACELINK_DEFAULT_SEG1_STOP);
+
+  // WebUI Save path: push the new override values into live WLED globals
+  // immediately so a Save is observable without a reboot. Boot path skips
+  // this — setup() runs applyRaceLinkDefaults() right after WLED's deserialise
+  // anyway, and calling it here would just be duplicate work.
+  if (!wasFirstCall) {
+    applyRaceLinkDefaults();
+  }
 
   return true;
 }
@@ -503,14 +658,34 @@ void UsermodRaceLink::refreshFieldsFromSegment() {
 
 // ========= Radio =========
 bool UsermodRaceLink::radioInit() {
-  // SPI
-  spi->begin(RACELINK_PIN_SCK, RACELINK_PIN_MISO, RACELINK_PIN_MOSI, RACELINK_PIN_NSS);
+  // Allocate radio pins via WLED's PinManager so a misconfigured LED bus on
+  // any of these pins fails loudly here instead of silently breaking SPI.
+  // MISO is allowed to be -1 (some modules omit it). Skip it from the alloc
+  // if so — PinManager rejects negative pins.
+  const PinManagerPinType pinsToAlloc[] = {
+    { pinSck,  true  },
+    { pinMosi, true  },
+    { pinMiso, false },
+    { pinNss,  true  },
+    { pinDio1, false },
+    { pinBusy, false },
+    { pinRst,  true  },
+  };
+  if (!PinManager::allocateMultiplePins(pinsToAlloc,
+                                        sizeof(pinsToAlloc) / sizeof(pinsToAlloc[0]),
+                                        PinOwner::UM_Unspecified)) {
+    DEBUG_PRINTLN(F("[RaceLink] PinManager allocation failed (LED bus conflict?)"));
+    return false;
+  }
+
+  // SPI bus init using the runtime-configured pins.
+  spi->begin(pinSck, pinMiso, pinMosi, pinNss);
 
   // RadioLib Module(cs, dio1, rst, busy, spi)
   #if defined(RACELINK_SX1262)
-  static SX1262 r(new Module(RACELINK_PIN_NSS, RACELINK_PIN_DIO1, RACELINK_PIN_RST, RACELINK_PIN_BUSY, *spi));
+  static SX1262 r(new Module(pinNss, pinDio1, pinRst, pinBusy, *spi));
   #elif defined(RACELINK_LLCC68)
-  static LLCC68 r(new Module(RACELINK_PIN_NSS, RACELINK_PIN_DIO1, RACELINK_PIN_RST, RACELINK_PIN_BUSY, *spi));
+  static LLCC68 r(new Module(pinNss, pinDio1, pinRst, pinBusy, *spi));
   #else
   #error "No RaceLink radio module defined"
   #endif
@@ -576,6 +751,138 @@ void UsermodRaceLink::clearMaster() {
   memset(masterLast3, 0, 3);
 }
 
+// ========= RaceLink-authoritative apply =========
+// Push every override slot into the live WLED globals, plus enforce the
+// non-override fleet-uniformity defaults (gamma, apBehavior). Called from:
+//
+//   * setup() — once at boot, after WLED's deserialiseConfig has populated
+//     globals from cfg.json. RaceLink overrides whatever WLED loaded.
+//   * readFromConfig() — after every WebUI Save (and any other re-deserialise),
+//     so override changes are live without a reboot.
+//   * OPC_CONFIG 0x0F — after the override slots have been reset to
+//     RACELINK_DEFAULT_*; this drives the inline "factory reset" apply.
+//
+// Idempotent: each block compares the current global to the desired value
+// and only writes (and logs) on actual divergence. A clean device produces
+// a silent boot log; a drifted one prints exactly which setting was corrected.
+// `configNeedsWrite=true` queues a cfg.json re-save so on-disk state matches
+// what the device is actually rendering.
+void UsermodRaceLink::applyRaceLinkDefaults() {
+  bool changed = false;
+
+  // ---- Target refresh rate ----------------------------------------------
+  if (strip.getTargetFps() != overrides.fps) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing FPS %u (was %u)\n"),
+                   (unsigned)overrides.fps, (unsigned)strip.getTargetFps());
+    strip.setTargetFps(overrides.fps);
+    changed = true;
+  }
+
+  // ---- Automatic Brightness Limiter -------------------------------------
+  if (BusManager::ablMilliampsMax() != overrides.ablMaxMa) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing ABL %u mA (was %u mA)\n"),
+                   (unsigned)overrides.ablMaxMa, (unsigned)BusManager::ablMilliampsMax());
+    BusManager::setMilliampsMax(overrides.ablMaxMa);
+    changed = true;
+  }
+
+  // ---- Gamma correction (non-override fleet-default) ---------------------
+  // Three globals (col on/off, bri on/off, val) — recompute the gamma table
+  // only if any of them actually changed.
+  const bool  defGCol = RACELINK_DEFAULT_GAMMA_COL;
+  const bool  defGBri = RACELINK_DEFAULT_GAMMA_BRI;
+  const float defGVal = RACELINK_DEFAULT_GAMMA_VAL;
+  if (gammaCorrectCol != defGCol || gammaCorrectBri != defGBri || gammaCorrectVal != defGVal) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing Gamma defaults: col=%d bri=%d val=%.2f (was col=%d bri=%d val=%.2f)\n"),
+                   (int)defGCol, (int)defGBri, (double)defGVal,
+                   (int)gammaCorrectCol, (int)gammaCorrectBri, (double)gammaCorrectVal);
+    gammaCorrectCol = defGCol;
+    gammaCorrectBri = defGBri;
+    gammaCorrectVal = defGVal;
+    NeoGammaWLEDMethod::calcGammaTable(gammaCorrectVal);
+    changed = true;
+  }
+
+  // ---- AP open behaviour (non-override fleet-default) -------------------
+  // RaceLink fleets keep the WiFi AP closed by default — operators reach a
+  // node via the triple-tap recovery gesture (which calls initAP(true)
+  // directly, bypassing apBehavior). Without this enforcement, a factory-
+  // reset device falls back to WLED's default AP_BEHAVIOR_BOOT_NO_CONN (0)
+  // and auto-opens its AP on every boot when no STA is configured — chatty
+  // RF, breaks the "node is silent until I want to talk to it" property.
+  if (apBehavior != (uint8_t)RACELINK_DEFAULT_AP_BEHAVIOR) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing apBehavior default %u (was %u)\n"),
+                   (unsigned)RACELINK_DEFAULT_AP_BEHAVIOR, (unsigned)apBehavior);
+    apBehavior = RACELINK_DEFAULT_AP_BEHAVIOR;
+    changed = true;
+  }
+
+  // ---- Segment 0 geometry -----------------------------------------------
+  if (strip.getSegmentsNum() >= 1) {
+    Segment& s0 = strip.getSegment(0);
+    if (s0.start != overrides.seg0Start || s0.stop != overrides.seg0Stop) {
+      DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing seg[0] geometry %u..%u (was %u..%u)\n"),
+                     (unsigned)overrides.seg0Start, (unsigned)overrides.seg0Stop,
+                     (unsigned)s0.start, (unsigned)s0.stop);
+      s0.setGeometry(overrides.seg0Start, overrides.seg0Stop);
+      changed = true;
+    }
+  }
+
+  // ---- Segment 1 geometry -----------------------------------------------
+  // Sentinel: start == stop means "seg[1] not configured" — leave whatever
+  // is already there alone (creating an empty seg[1] would just waste a
+  // slot in WLED's segment vector).
+  if (overrides.seg1Start != overrides.seg1Stop) {
+    if (strip.getSegmentsNum() <= 1) {
+      strip.appendSegment(overrides.seg1Start, overrides.seg1Stop);
+      DEBUG_PRINTF_P(PSTR("[RaceLink] appended seg[1] %u..%u\n"),
+                     (unsigned)overrides.seg1Start, (unsigned)overrides.seg1Stop);
+      changed = true;
+    }
+    if (strip.getSegmentsNum() > 1) {
+      Segment& s1 = strip.getSegment(1);
+      if (s1.start != overrides.seg1Start || s1.stop != overrides.seg1Stop) {
+        DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing seg[1] geometry %u..%u (was %u..%u)\n"),
+                       (unsigned)overrides.seg1Start, (unsigned)overrides.seg1Stop,
+                       (unsigned)s1.start, (unsigned)s1.stop);
+        s1.setGeometry(overrides.seg1Start, overrides.seg1Stop);
+        changed = true;
+      }
+    }
+  }
+
+  // ---- Default brightness (briS) ----------------------------------------
+  // Affects the SAVED brightness (boot value, restore target) — the LIVE
+  // brightness `bri` is driven by SYNC/CONTROL packets and is not touched
+  // here. OPC_CONFIG 0x09 explicitly snaps `bri` for a UX-immediate update.
+  if (briS != overrides.briS) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing briS %u (was %u)\n"),
+                   (unsigned)overrides.briS, (unsigned)briS);
+    briS = overrides.briS;
+    changed = true;
+  }
+
+  // ---- Transition duration ----------------------------------------------
+  if (transitionDelayDefault != overrides.transitionMs) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing transitionDelayDefault %u (was %u)\n"),
+                   (unsigned)overrides.transitionMs, (unsigned)transitionDelayDefault);
+    transitionDelayDefault = overrides.transitionMs;
+    changed = true;
+  }
+
+  // Persist via WLED's canonical deferred-save mechanism: the main loop
+  // calls serializeConfigToFS() in its next iteration when configNeedsWrite
+  // is set. serializeConfig() reads the live runtime globals we just wrote,
+  // so cfg.json ends up reflecting the RaceLink-enforced values. UI / JSON
+  // API will therefore agree with what the device is actually rendering.
+  if (changed) {
+    DEBUG_PRINTLN(F("[RaceLink] cfg.json scheduled for re-save with enforced overrides"));
+    configNeedsWrite = true;
+    stateUpdated(CALL_MODE_NO_NOTIFY);
+  }
+}
+
 // ========= Direct-effect visualisations =========
 
 void UsermodRaceLink::showPairConfirmedEffect() {
@@ -583,9 +890,10 @@ void UsermodRaceLink::showPairConfirmedEffect() {
   // preset slot is reserved anymore, operator can freely assign all slots.
   Segment& seg = strip.getMainSegment();
   seg.setMode(FX_MODE_BREATH);
-  seg.setColor(0, RGBW32(255, 255, 255, 0));
-  seg.intensity = 128;
   seg.speed     = 128;
+  seg.intensity = 128;
+  seg.setColor(0, RGBW32(255, 255, 255, 0));   // white foreground
+  seg.setColor(1, 0);                           // black background
   bri = 128;
   stateChanged = true;
   stateUpdated(CALL_MODE_DIRECT_CHANGE);
@@ -596,11 +904,9 @@ void UsermodRaceLink::showBootRandomColor() {
   // did NOT set a boot preset (bootPreset == 0). Serves as a visual
   // "device has booted" signal.
   // esp_random() is the ESP32's hardware RNG (no seed needed).
+  if (bri == 0) bri = briS ? briS : 128;
   uint8_t pick = (uint8_t)(esp_random() % 3);
   applyCycleColor(pick);
-  if (bri == 0) bri = briS ? briS : 128;
-  stateChanged = true;
-  stateUpdated(CALL_MODE_INIT);
   // Seed the ring-buffer cycle: boot already shows one primary color (count=1),
   // the next click jumps to (pick+1) % 3. That guarantees all three primary
   // colors have been cycled through after boot+2 clicks before switching to
@@ -622,6 +928,9 @@ void UsermodRaceLink::applyCycleColor(uint8_t idx) {
   Segment& seg = strip.getMainSegment();
   seg.setMode(FX_MODE_STATIC);
   seg.setColor(0, RGBW32(colPri[0], colPri[1], colPri[2], 0));
+
+  stateChanged = true;
+  stateUpdated(CALL_MODE_DIRECT_CHANGE);
 }
 
 void UsermodRaceLink::applyColorCycleStep(uint32_t now) {
@@ -983,6 +1292,83 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
           WiFi.softAPdisconnect(true);
           apActive = false;
         }
+      } else if (p.option == 0x05) { // Set FPS override
+        overrides.fps = p.data0;
+        strip.setTargetFps(overrides.fps);
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: FPS set to %u\n"), (unsigned)overrides.fps);
+      } else if (p.option == 0x06) { // Set Segment 0 geometry
+        overrides.seg0Start = (uint16_t)p.data0 | ((uint16_t)p.data1 << 8);
+        overrides.seg0Stop  = (uint16_t)p.data2 | ((uint16_t)p.data3 << 8);
+        if (strip.getSegmentsNum() >= 1) {
+          strip.getSegment(0).setGeometry(overrides.seg0Start, overrides.seg0Stop);
+        }
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: seg[0] geometry set to %u..%u\n"),
+                       (unsigned)overrides.seg0Start, (unsigned)overrides.seg0Stop);
+      } else if (p.option == 0x07) { // Set Segment 1 geometry
+        overrides.seg1Start = (uint16_t)p.data0 | ((uint16_t)p.data1 << 8);
+        overrides.seg1Stop  = (uint16_t)p.data2 | ((uint16_t)p.data3 << 8);
+        // Append seg[1] if missing (no-op if already present or max segments reached)
+        if (strip.getSegmentsNum() <= 1) {
+          strip.appendSegment(overrides.seg1Start, overrides.seg1Stop);
+        }
+        if (strip.getSegmentsNum() > 1) {
+          strip.getSegment(1).setGeometry(overrides.seg1Start, overrides.seg1Stop);
+        }
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: seg[1] geometry set to %u..%u\n"),
+                       (unsigned)overrides.seg1Start, (unsigned)overrides.seg1Stop);
+      } else if (p.option == 0x08) { // Set ABL max mA override
+        overrides.ablMaxMa = (uint16_t)p.data0 | ((uint16_t)p.data1 << 8);
+        BusManager::setMilliampsMax(overrides.ablMaxMa);
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: ABL set to %u mA\n"), (unsigned)overrides.ablMaxMa);
+      } else if (p.option == 0x09) { // Set default brightness override
+        overrides.briS = p.data0;
+        briS = overrides.briS;
+        // Snap LIVE brightness too so the strip visibly updates without a
+        // reboot — operators editing the row in the host dialog expect
+        // immediate feedback. The live value can still be overridden later
+        // by OPC_CONTROL/OPC_SYNC; this is just the at-save snapshot.
+        bri = overrides.briS;
+        stateUpdated(CALL_MODE_NO_NOTIFY);
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: briS set to %u (live bri synced)\n"),
+                       (unsigned)overrides.briS);
+      } else if (p.option == 0x0A) { // Set transition duration override
+        overrides.transitionMs = (uint16_t)p.data0 | ((uint16_t)p.data1 << 8);
+        transitionDelayDefault = overrides.transitionMs;
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: transitionDelayDefault set to %u ms\n"),
+                       (unsigned)overrides.transitionMs);
+      } else if (p.option == 0x0F) { // Reset every override slot to RACELINK_DEFAULT_*
+        overrides.fps          = (uint8_t)RACELINK_DEFAULT_FPS;
+        overrides.ablMaxMa     = (uint16_t)RACELINK_DEFAULT_ABL_MAX_MA;
+        overrides.seg0Start    = (uint16_t)RACELINK_DEFAULT_SEG0_START;
+        overrides.seg0Stop     = (uint16_t)RACELINK_DEFAULT_SEG0_STOP;
+        overrides.seg1Start    = (uint16_t)RACELINK_DEFAULT_SEG1_START;
+        overrides.seg1Stop     = (uint16_t)RACELINK_DEFAULT_SEG1_STOP;
+        overrides.briS         = (uint8_t)RACELINK_DEFAULT_BRIS;
+        overrides.transitionMs = (uint16_t)RACELINK_DEFAULT_TRANSITION_MS;
+
+        // resetSegments() rebuilds the segment vector to WLED's default
+        // (one segment spanning the full strip). Unsafe during
+        // strip.service() — guard with suspend/resume. applyRaceLinkDefaults()
+        // below then re-asserts our seg0 sentinel (stop==0 → full strip),
+        // which is a no-op against this fresh state.
+        strip.suspend();
+        strip.resetSegments();
+        strip.resume();
+
+        // Snap LIVE brightness too (same reasoning as 0x09).
+        bri = (uint8_t)RACELINK_DEFAULT_BRIS;
+
+        // applyRaceLinkDefaults() handles FPS/ABL/briS/transition/seg
+        // enforcement + stateUpdated + configNeedsWrite uniformly.
+        applyRaceLinkDefaults();
+
+        DEBUG_PRINTLN(F("[RaceLink] OPC_CONFIG 0x0F: every override reset to RACELINK_DEFAULT_* (no reboot required)"));
       } else if (p.option == 0x81) { // Reboot Node
         if (p.data0 != 0) doReboot = true;
       }
@@ -1020,6 +1406,74 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       sendStatusReplyTo(h.sender);
       acted = true;
       DEBUG_PRINTLN(F("[RaceLink] GET_STATUS -> STATUS_REPLY"));
+    } break;
+
+    case OPC_GET_CONFIG: { // read-back of an OPC_CONFIG-style option
+      // Body shape: 1 byte (option to read). Reply reuses P_Config (option +
+      // data0..3) so the host's OPC_CONFIG codec can decode it unchanged.
+      // Returns the *live* runtime value — and because applyRaceLinkDefaults()
+      // runs after every OPC_CONFIG / WebUI Save, the live value is always
+      // in sync with the override slot. Host sees "what is the device using
+      // right now", which equals what cfg.json holds.
+      RaceLinkProto::P_GetConfig p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+      if (RaceLinkTransport::isBroadcast3(h.receiver)) return; // unicast-only, like OPC_CONFIG
+
+      uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+      bool readable = true;
+      switch (p.option) {
+        case 0x05: { // FPS
+          d0 = strip.getTargetFps();
+        } break;
+        case 0x06: { // Segment 0 geometry
+          uint16_t s = 0, e = 0;
+          if (strip.getSegmentsNum() >= 1) {
+            Segment& seg = strip.getSegment(0);
+            s = seg.start; e = seg.stop;
+          }
+          d0 = (uint8_t)(s & 0xFF); d1 = (uint8_t)(s >> 8);
+          d2 = (uint8_t)(e & 0xFF); d3 = (uint8_t)(e >> 8);
+        } break;
+        case 0x07: { // Segment 1 geometry
+          uint16_t s = 0, e = 0;
+          if (strip.getSegmentsNum() >= 2) {
+            Segment& seg = strip.getSegment(1);
+            s = seg.start; e = seg.stop;
+          }
+          d0 = (uint8_t)(s & 0xFF); d1 = (uint8_t)(s >> 8);
+          d2 = (uint8_t)(e & 0xFF); d3 = (uint8_t)(e >> 8);
+        } break;
+        case 0x08: { // ABL max mA
+          const uint16_t mA = BusManager::ablMilliampsMax();
+          d0 = (uint8_t)(mA & 0xFF); d1 = (uint8_t)(mA >> 8);
+        } break;
+        case 0x09: { // briS
+          d0 = briS;
+        } break;
+        case 0x0A: { // transitionDelayDefault
+          const uint16_t ms = transitionDelayDefault;
+          d0 = (uint8_t)(ms & 0xFF); d1 = (uint8_t)(ms >> 8);
+        } break;
+        #if DEV_TYPE == 50
+        case 0x8C: { // STARTBLOCK: number of slots
+          d0 = numberOfSlots;
+        } break;
+        case 0x8D: { // STARTBLOCK: first slot
+          d0 = firstSlot;
+        } break;
+        #endif
+        default: {
+          // Unknown / write-only option (e.g. 0x02 ClearMaster, 0x0F ClearAll,
+          // 0x81 Reboot). No reply -> host's send_and_wait_for_reply times out
+          // gracefully and the dialog row shows "device: ? [Retry]".
+          readable = false;
+        } break;
+      }
+      if (!readable) break;
+      sendGetConfigReplyTo(h.sender, p.option, d0, d1, d2, d3);
+      acted = true;
+      DEBUG_PRINTF_P(PSTR("[RaceLink] GET_CONFIG opt=0x%02X -> %u %u %u %u\n"),
+                     (unsigned)p.option, (unsigned)d0, (unsigned)d1, (unsigned)d2, (unsigned)d3);
     } break;
 
     case OPC_STREAM: {
@@ -1135,6 +1589,30 @@ void UsermodRaceLink::sendStatusReplyTo(const uint8_t destLast3[3]) {
 
   RaceLinkTransport::scheduleSend(rl, out, n);
   //RaceLinkTransport::scheduleSend(rl, out, n, 50, 2500);
+}
+
+void UsermodRaceLink::sendGetConfigReplyTo(const uint8_t destLast3[3], uint8_t option,
+                                           uint8_t data0, uint8_t data1,
+                                           uint8_t data2, uint8_t data3) {
+  // GET_CONFIG_REPLY: same opcode as the request with the N2M direction bit
+  // and a P_Config-shaped body (option + data0..3). Reuses the standard
+  // build() helper so the byte layout matches every other OPC_CONFIG frame
+  // on the wire. Data byte packing per option follows the matching write
+  // command's layout (see OPC_CONFIG dispatcher above).
+  using namespace RaceLinkProto;
+  uint8_t out[32];
+
+  P_Config p{};
+  p.option = option;
+  p.data0  = data0;
+  p.data1  = data1;
+  p.data2  = data2;
+  p.data3  = data3;
+
+  uint8_t t = make_type(DIR_N2M, OPC_GET_CONFIG);
+  uint8_t n = build(out, rl.myLast3, destLast3, t, p);
+
+  RaceLinkTransport::scheduleSend(rl, out, n);
 }
 
 // ========= PRESET handler (always immediate) =========
@@ -1674,7 +2152,8 @@ lastSyncLocalMs = nowMs;
 
 // --- Callback bridges as static members ---
 void UsermodRaceLink::on_rx_node(const uint8_t* pkt, uint8_t len,
-                                        int16_t rssi, int8_t snr, void* ctx) {
+                                        int16_t rssi, int8_t snr,
+                                        void* ctx) {
   auto* self = static_cast<UsermodRaceLink*>(ctx);
   if (!self || !pkt || len == 0) return;
 

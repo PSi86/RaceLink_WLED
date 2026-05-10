@@ -17,32 +17,13 @@
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 
-// -----------------------------
-// Pin defaults (override via PlatformIO build_flags: -D ...)
-// -----------------------------
-#ifndef RACELINK_EPAPER_CS
-  #define RACELINK_EPAPER_CS   10
-#endif
-#ifndef RACELINK_EPAPER_BUSY
-  #define RACELINK_EPAPER_BUSY 3
-#endif
-#ifndef RACELINK_EPAPER_RST
-  #define RACELINK_EPAPER_RST  46
-#endif
-#ifndef RACELINK_EPAPER_DC
-  #define RACELINK_EPAPER_DC   9
-#endif
-
-// Configurable SPI pins (MISO is typically not used by ePaper modules)
-#ifndef RACELINK_EPAPER_MOSI
-  #define RACELINK_EPAPER_MOSI 11
-#endif
-#ifndef RACELINK_EPAPER_SCK
-  #define RACELINK_EPAPER_SCK  12
-#endif
-#ifndef RACELINK_EPAPER_MISO
-  #define RACELINK_EPAPER_MISO -1
-#endif
+// Pin assignments are now runtime parameters supplied via epaperInit().
+// The old compile-time defines (RACELINK_EPAPER_MOSI etc.) live in
+// racelink_wled.h as defaults that seed the UsermodRaceLink::epd* members.
+// At static-init time we instantiate the GxEPD2 display with -1 placeholder
+// pins (safe — GxEPD2_EPD's constructor only stores pin numbers, no GPIO
+// activation happens until display.init() runs). The worker task writes
+// the real pin numbers via display.epd2.setPins() before calling init().
 
 // -----------------------------
 // Deferred refresh behavior
@@ -103,9 +84,9 @@ static SPIClass epdSPI;
 
 /* 2.9'' EPD Module (B/W), DEPG0290BS 128x296, SSD1680
 GxEPD2_290_BS.h, GxEPD2_290_BS.cpp: no changes */
-// static GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(
-//   GxEPD2_290_BS(/*CS=*/ RACELINK_EPAPER_CS, /*DC=*/ RACELINK_EPAPER_DC, /*RES=*/ RACELINK_EPAPER_RST, /*BUSY=*/ RACELINK_EPAPER_BUSY)
-// );
+// (legacy alternative panel reference — left here as a guide if the
+// hardware ever switches back; keep in sync with the configurable wrapper
+// pattern below if uncommented.)
 
 
 /* 3.7'' EPD Module, GDEY037T03 240x416, UC8253
@@ -115,8 +96,30 @@ GxEPD2_370_GDEY037T03.h:
     static const bool hasFastPartialUpdate = false; // set this false to force full refresh always
     static const bool useFastFullUpdate = false; // set false for extended (low) temperature range, 1005000us vs 2950000us
 */
-static GxEPD2_BW<GxEPD2_370_GDEY037T03, GxEPD2_370_GDEY037T03::HEIGHT> display(
- GxEPD2_370_GDEY037T03(/*CS=5*/ RACELINK_EPAPER_CS, /*DC=*/ RACELINK_EPAPER_DC, /*RES=*/ RACELINK_EPAPER_RST, /*BUSY=*/ RACELINK_EPAPER_BUSY)
+
+// GxEPD2_EPD's _cs/_dc/_rst/_busy are protected: derive a thin wrapper that
+// inherits the constructor and exposes a setPins() method so we can apply
+// runtime-configured pin numbers before display.init() is called. This avoids
+// reaching into protected members via static_cast tricks (which would be UB).
+class GxEPD2_370_GDEY037T03_Configurable : public GxEPD2_370_GDEY037T03
+{
+public:
+  using GxEPD2_370_GDEY037T03::GxEPD2_370_GDEY037T03;   // inherit constructors
+  void setPins(int16_t cs, int16_t dc, int16_t rst, int16_t busy)
+  {
+    _cs   = cs;
+    _dc   = dc;
+    _rst  = rst;
+    _busy = busy;
+  }
+};
+
+// Instantiate with -1 placeholder pins. The real pin numbers are written by
+// epaperInit() into display.epd2.setPins() *before* the worker task calls
+// display.init(); this is safe because GxEPD2_EPD's constructor only stores
+// the pin numbers — no pinMode / digitalWrite happens until init() runs.
+static GxEPD2_BW<GxEPD2_370_GDEY037T03_Configurable, GxEPD2_370_GDEY037T03_Configurable::HEIGHT> display(
+ GxEPD2_370_GDEY037T03_Configurable(/*CS=*/ -1, /*DC=*/ -1, /*RES=*/ -1, /*BUSY=*/ -1)
 );
 
 // -----------------------------
@@ -154,6 +157,17 @@ static volatile bool g_epdReqInit    = false; // request: run SPI begin + displa
 static volatile bool g_epdReqRefresh = false; // request: re-render with current snapshot
 static volatile bool g_epdReqFull    = false; // refresh kind selected by main at dispatch time
 static volatile bool g_epdBusy       = false; // worker is currently mid-init or mid-render
+
+// -----------------------------
+// Pin assignments (set by epaperInit, read by the worker task)
+// -----------------------------
+static int8_t g_epdSck  = -1;
+static int8_t g_epdMiso = -1;
+static int8_t g_epdMosi = -1;
+static int8_t g_epdCs   = -1;
+static int8_t g_epdDc   = -1;
+static int8_t g_epdRst  = -1;
+static int8_t g_epdBusy_pin = -1;   // suffix avoids clash with g_epdBusy (busy-flag) above
 
 // -----------------------------
 // Helpers
@@ -455,7 +469,13 @@ static void epaperTask(void* /*arg*/)
       g_epdReqInit = false;
       g_epdBusy = true;
 
-      epdSPI.begin(RACELINK_EPAPER_SCK, RACELINK_EPAPER_MISO, RACELINK_EPAPER_MOSI, RACELINK_EPAPER_CS);
+      // Apply runtime-configured pins to the GxEPD2 display before init().
+      // Constructor pins were -1 sentinels; setPins() updates the protected
+      // _cs/_dc/_rst/_busy members so display.init() will pinMode the right
+      // GPIOs.
+      display.epd2.setPins(g_epdCs, g_epdDc, g_epdRst, g_epdBusy_pin);
+
+      epdSPI.begin(g_epdSck, g_epdMiso, g_epdMosi, g_epdCs);
       display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
       display.init(115200, false, 50, false); // reset duration was 50
       g_hibernated = false;
@@ -520,8 +540,21 @@ static void epaperTask(void* /*arg*/)
 // -----------------------------
 // Public API (non-blocking)
 // -----------------------------
-void epaperInit()
+void epaperInit(int8_t mosi, int8_t sck, int8_t miso,
+                int8_t cs,   int8_t dc,  int8_t rst, int8_t busy)
 {
+  // Stash the pin assignments for the worker task. setPins() runs on the
+  // worker before display.init(), so reading these from the main thread is
+  // safe — they're written here once and never change for the lifetime of
+  // the device (UI changes trigger a reboot).
+  g_epdSck      = sck;
+  g_epdMiso     = miso;
+  g_epdMosi     = mosi;
+  g_epdCs       = cs;
+  g_epdDc       = dc;
+  g_epdRst      = rst;
+  g_epdBusy_pin = busy;
+
   // Initialize main-thread state before the worker can observe it.
   for (uint8_t i = 0; i < 8; i++)
   {
