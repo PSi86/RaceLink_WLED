@@ -87,6 +87,39 @@ using GateCore = DeviceState;  // alias kept for existing call sites
   #define CALL_MODE_NO_NOTIFY CALL_MODE_DIRECT_CHANGE
 #endif
 
+// Master-Quiet-Gate: physical-button gestures (color/brightness) only fire
+// when the device has not received a packet from the paired master for at
+// least this many ms. The triple-tap hotspot recovery ignores this gate.
+#ifndef RACELINK_MASTER_QUIET_MS
+  #define RACELINK_MASTER_QUIET_MS 60000
+#endif
+
+// Hold threshold (= WLED_LONG_PRESS) for the GPIO 0 button.
+#ifndef RACELINK_BTN_LONG_MS
+  #define RACELINK_BTN_LONG_MS 600
+#endif
+
+// Max gap between successive short clicks counted as a multi-tap burst.
+#ifndef RACELINK_BTN_MULTI_WINDOW_MS
+  #define RACELINK_BTN_MULTI_WINDOW_MS 500
+#endif
+
+// Brightness step per fade tick while the button is held.
+#ifndef RACELINK_BTN_BRI_STEP
+  #define RACELINK_BTN_BRI_STEP 4
+#endif
+
+// Minimum interval between brightness fade updates while held.
+#ifndef RACELINK_BTN_FADE_TICK_MS
+  #define RACELINK_BTN_FADE_TICK_MS 30
+#endif
+
+// Idle window for the single-click colour cycle. After this many ms with
+// no short-click, the next click restarts the R→G→B→random sequence at R.
+#ifndef RACELINK_BTN_COLOR_RESET_MS
+  #define RACELINK_BTN_COLOR_RESET_MS 10000
+#endif
+
 // PRESET packet (OPC_PRESET, 4B P_Preset):
 //   groupId    : group selector
 //   flags      : IGNORED by WLED (still on the wire for host compatibility).
@@ -123,7 +156,11 @@ enum GateStatusCfgFlags : uint8_t {
 // Long Button press (600ms): Toggle Preset
 
 
-// ------------ HT-CT62 (ESP32-C3 + SX1262) fixed pins ------------
+// ------------ Radio pin defaults (overridable via build_flags or usermod config) ------------
+// Defaults below match HT-CT62 (ESP32-C3 + SX1262). Per-target build profiles override
+// via -D RACELINK_PIN_*=... so first boot picks the correct pins per hardware variant.
+// The runtime usermod settings (UsermodRaceLink::pin*) read these as initial values
+// and persist any UI override into cfg.json — see addToConfig/readFromConfig.
 #ifndef RACELINK_PIN_MOSI
   #define RACELINK_PIN_MOSI   7
 #endif
@@ -144,6 +181,34 @@ enum GateStatusCfgFlags : uint8_t {
 #endif
 #ifndef RACELINK_PIN_RST
   #define RACELINK_PIN_RST    5
+#endif
+
+// ------------ ePaper pin defaults (only when -D RACELINK_EPAPER is set) ------------
+// Mirror the defaults in racelink_epaper.cpp so the UsermodRaceLink members can use
+// them as initializers. The .cpp keeps its own #ifndef guards in case this header
+// is not included there (racelink_epaper.cpp only pulls in racelink_epaper.h).
+#ifdef RACELINK_EPAPER
+  #ifndef RACELINK_EPAPER_CS
+    #define RACELINK_EPAPER_CS   10
+  #endif
+  #ifndef RACELINK_EPAPER_BUSY
+    #define RACELINK_EPAPER_BUSY 3
+  #endif
+  #ifndef RACELINK_EPAPER_RST
+    #define RACELINK_EPAPER_RST  46
+  #endif
+  #ifndef RACELINK_EPAPER_DC
+    #define RACELINK_EPAPER_DC   9
+  #endif
+  #ifndef RACELINK_EPAPER_MOSI
+    #define RACELINK_EPAPER_MOSI 11
+  #endif
+  #ifndef RACELINK_EPAPER_SCK
+    #define RACELINK_EPAPER_SCK  12
+  #endif
+  #ifndef RACELINK_EPAPER_MISO
+    #define RACELINK_EPAPER_MISO -1
+  #endif
 #endif
 
 // ------------ RaceLink RaceLink defaults (EU868) ------------
@@ -169,6 +234,75 @@ enum GateStatusCfgFlags : uint8_t {
   #define RACELINK_PREAMBLE   8
 #endif
 
+// ------------ Fleet-uniformity defaults (applied on every boot) ------------
+// These values are re-applied by applyRaceLinkDefaults() in setup() after WLED
+// has deserialised cfg.json — overriding any per-device drift introduced via
+// the WLED UI. This is the runtime mechanism that previously was attempted via
+// `-D WLED_FPS=...` build flag but doesn't work without modifying upstream
+// FX.h (the source-level `#define WLED_FPS 42` would silently win over -D).
+//
+// Each macro is `#ifndef`-guarded so a build profile can override per-platform
+// (e.g. to test a different FPS for a hardware variant) without editing this
+// header. The defaults below match the operator-validated 2026-05-08 fleet
+// settings that resolved the V3↔V4 Strobe drift (Issue 3).
+//
+// Future direction: OPC_CONFIG (option codes 0x05+) will let the master adjust
+// these at runtime per device. For now they are pure boot-time enforcement —
+// any UI change is reverted on next reboot, which is intentional.
+#ifndef RACELINK_DEFAULT_FPS
+  #define RACELINK_DEFAULT_FPS         75   // Target refresh rate (0..250). 0 = unlimited (NOT recommended for sync groups).
+#endif
+#ifndef RACELINK_DEFAULT_ABL_MAX_MA
+  #define RACELINK_DEFAULT_ABL_MAX_MA  0    // Brightness limiter budget in mA. 0 = ABL disabled.
+#endif
+#ifndef RACELINK_DEFAULT_GAMMA_COL
+  #define RACELINK_DEFAULT_GAMMA_COL   true // gammaCorrectCol — gamma on color
+#endif
+#ifndef RACELINK_DEFAULT_GAMMA_BRI
+  #define RACELINK_DEFAULT_GAMMA_BRI   false // gammaCorrectBri — gamma on brightness
+#endif
+#ifndef RACELINK_DEFAULT_GAMMA_VAL
+  #define RACELINK_DEFAULT_GAMMA_VAL   2.2f // gammaCorrectVal — gamma exponent (clamped to [0.1, 3.0])
+#endif
+#ifndef RACELINK_DEFAULT_AP_BEHAVIOR
+  // 3 = AP_BEHAVIOR_BUTTON_ONLY = "Never (not recommended)" in WLED's WiFi
+  // settings UI. Prevents auto-opening the AP on every boot, which is the
+  // WLED post-factory-reset default (AP_BEHAVIOR_BOOT_NO_CONN = 0). The
+  // RaceLink usermod's triple-tap gesture calls WLED::instance().initAP(true)
+  // directly, bypassing apBehavior, so hotspot recovery still works.
+  #define RACELINK_DEFAULT_AP_BEHAVIOR  AP_BEHAVIOR_BUTTON_ONLY
+#endif
+
+// "Reset to RaceLink defaults" target values for the override fields the
+// usermod always enforces (briS, transition, segments). applyRaceLinkDefaults()
+// applies these on every boot AND on every WebUI/OPC_CONFIG change — RaceLink
+// is the sole source of truth for these settings. OPC_CONFIG 0x0F resets the
+// override slots back to these compile-time values.
+#ifndef RACELINK_DEFAULT_BRIS
+  #define RACELINK_DEFAULT_BRIS         128  // Default boot brightness (briS, 0..255).
+#endif
+#ifndef RACELINK_DEFAULT_TRANSITION_MS
+  #define RACELINK_DEFAULT_TRANSITION_MS 700 // Default transition duration in ms.
+#endif
+
+// Segment geometry defaults. seg0 spans LEDs 0..SEG0_STOP on a fresh install
+// (or 0x0F reset). seg1 sentinel: seg1Start == seg1Stop means "seg[1] not
+// configured" — applyRaceLinkDefaults() then skips appendSegment/setGeometry,
+// matching WLED's own resetSegments() result of one segment over the strip.
+// Adjust SEG0_STOP per build profile if the typical strip length differs.
+#ifndef RACELINK_DEFAULT_SEG0_START
+  #define RACELINK_DEFAULT_SEG0_START  0
+#endif
+#ifndef RACELINK_DEFAULT_SEG0_STOP
+  #define RACELINK_DEFAULT_SEG0_STOP   200
+#endif
+#ifndef RACELINK_DEFAULT_SEG1_START
+  #define RACELINK_DEFAULT_SEG1_START  0
+#endif
+#ifndef RACELINK_DEFAULT_SEG1_STOP
+  #define RACELINK_DEFAULT_SEG1_STOP   0
+#endif
+
 
 class UsermodRaceLink : public Usermod {
 public:
@@ -179,6 +313,7 @@ public:
   void addToConfig(JsonObject& root) override;
   bool readFromConfig(JsonObject& root) override;
   void onStateChange(uint8_t mode) override;
+  bool handleButton(uint8_t b) override;
   uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
 
 private:
@@ -195,7 +330,57 @@ private:
   #else
     #error "No RaceLink radio module defined"
   #endif
-  
+
+  // Pin assignments (defaults from build flags above; runtime-overridable via
+  // usermod config). See addToConfig/readFromConfig for the JSON schema.
+  // A pin change in the UI sets the global doReboot flag; SPI is re-init'd at
+  // boot using the saved values.
+  int8_t pinSck  = RACELINK_PIN_SCK;
+  int8_t pinMiso = RACELINK_PIN_MISO;
+  int8_t pinMosi = RACELINK_PIN_MOSI;
+  int8_t pinNss  = RACELINK_PIN_NSS;
+  int8_t pinDio1 = RACELINK_PIN_DIO1;
+  int8_t pinBusy = RACELINK_PIN_BUSY;
+  int8_t pinRst  = RACELINK_PIN_RST;
+
+  #ifdef RACELINK_EPAPER
+    // ePaper SPI bus + control pins. CS/DC/RST/BUSY are written into the
+    // GxEPD2 display object during epaperInit(); SCK/MISO/MOSI configure
+    // the dedicated HSPI bus.
+    int8_t epdSck  = RACELINK_EPAPER_SCK;
+    int8_t epdMiso = RACELINK_EPAPER_MISO;
+    int8_t epdMosi = RACELINK_EPAPER_MOSI;
+    int8_t epdCs   = RACELINK_EPAPER_CS;
+    int8_t epdDc   = RACELINK_EPAPER_DC;
+    int8_t epdRst  = RACELINK_EPAPER_RST;
+    int8_t epdBusy = RACELINK_EPAPER_BUSY;
+  #endif
+
+  // True until the first readFromConfig() call returns. Used to suppress
+  // the reboot-on-pin-change behavior during the initial cfg.json deserialize
+  // (which always runs before setup()), so a fresh boot doesn't reboot itself.
+  bool firstReadFromConfig = true;
+
+  // ===== RaceLink-authoritative overrides (always active) =====
+  // RaceLink is the single source of truth for these six settings. Every
+  // override slot is always populated (compile-time RACELINK_DEFAULT_* on
+  // first boot, then whatever the host or operator most recently saved).
+  // applyRaceLinkDefaults() unconditionally pushes the slot values into
+  // the live WLED globals on every boot AND after every cfg.json reload
+  // (WebUI Save → readFromConfig → applyRaceLinkDefaults). OPC_CONFIG
+  // 0x05..0x0A write a single slot; 0x0F resets every slot to its
+  // RACELINK_DEFAULT_*. Persisted as the "RaceLink.overrides" sub-object
+  // by addToConfig/readFromConfig.
+  struct RaceLinkOverrides {
+    uint8_t  fps           = (uint8_t)RACELINK_DEFAULT_FPS;
+    uint16_t ablMaxMa      = (uint16_t)RACELINK_DEFAULT_ABL_MAX_MA;
+    uint16_t seg0Start     = (uint16_t)RACELINK_DEFAULT_SEG0_START;
+    uint16_t seg0Stop      = (uint16_t)RACELINK_DEFAULT_SEG0_STOP;
+    uint16_t seg1Start     = (uint16_t)RACELINK_DEFAULT_SEG1_START;
+    uint16_t seg1Stop      = (uint16_t)RACELINK_DEFAULT_SEG1_STOP;
+    uint8_t  briS          = (uint8_t)RACELINK_DEFAULT_BRIS;
+    uint16_t transitionMs  = (uint16_t)RACELINK_DEFAULT_TRANSITION_MS;
+  } overrides;
 
   //UsermodBattery* bat = nullptr;
   um_data_t* batteryUM = nullptr;
@@ -295,6 +480,56 @@ private:
   uint8_t masterFull6[6] = {0};
   bool   masterFull6Known = false;
 
+  // Session-only master-contact tracking (NOT persisted) — drives the
+  // physical-button master-quiet gate. lastMasterRxMs is meaningful only
+  // when anyMasterRxSinceBoot is true.
+  //
+  // Why not reuse rl.lastRxAtMs (transport core)? That field is ticked in
+  // the transport before the senderAllowed() filter — it captures any
+  // packet whose receiver matches us, including OPC_DEVICES broadcasts
+  // from a stranger gateway in the next room (different paired master)
+  // or from any gateway during pre-pairing discovery. Using it here would
+  // close the button gate on those packets even though they have no
+  // RaceLink effect on this node. lastMasterRxMs is set only in
+  // learnMasterFromSender() and in handlePacket() guarded by
+  //   masterKnown && same3(h.sender, masterLast3)
+  // so it strictly tracks "our paired master is active right now".
+  //
+  // anyMasterRxSinceBoot disambiguates "never heard from master" from
+  // "60 s elapsed since contact" — without it, lastMasterRxMs == 0 at
+  // boot would falsely register as "master spoke 0 ms ago" for the first
+  // 60 s and lock the button on a fresh power-up.
+  uint32_t lastMasterRxMs = 0;
+  bool     anyMasterRxSinceBoot = false;
+
+  // Custom button state for GPIO 0 (replaces WLED's default short/long/double
+  // mapping). Driven from our own loop() via pollPhysicalButton() so we sample
+  // the pin at full loop rate — WLED's UsermodManager::handleButton() dispatch
+  // is throttled to ~250 ms while strip.isUpdating(), which loses 3-click
+  // bursts and adds noticeable lag to release detection.
+  struct BtnState {
+    bool     down              = false;
+    bool     longHandled       = false; // hold passed RACELINK_BTN_LONG_MS, fade running
+    bool     briDirUp          = true;  // current ping-pong direction; flips on hitting bri limits
+    uint32_t pressedAtMs       = 0;
+    uint32_t lastFadeTickMs    = 0;
+    uint8_t  pendingShortClicks = 0;    // accumulates within RACELINK_BTN_MULTI_WINDOW_MS
+    uint32_t lastShortReleaseMs = 0;
+    // Single-click colour cycle. The fixed primary order is R(0)→G(1)→B(2)
+    // wrapped as a ring buffer; boot picks a random starting index from
+    // {0,1,2} and the click cycle advances `nextPrimaryIdx = (idx+1) % 3`
+    // so all three primaries are guaranteed reachable regardless of where
+    // the boot pick landed (e.g. boot=G → click 1=B → click 2=R → click 3+=
+    // random). primariesShownCount tracks how many primaries have already
+    // been displayed in the current cycle (including the boot colour); once
+    // it reaches 3 the click action switches to random RGB. After
+    // RACELINK_BTN_COLOR_RESET_MS without a short-click the cycle is
+    // re-seeded with a fresh random starting index on the next click.
+    uint8_t  nextPrimaryIdx       = 0;
+    uint8_t  primariesShownCount  = 0;
+    uint32_t lastColorClickMs     = 0;
+  } btn;
+
   // Discovery reply target
   uint8_t targetForReplyLast3[3] = {0};
   uint8_t startupIdentifyStage = 0;
@@ -322,6 +557,37 @@ private:
   void persistMasterIfNeeded();
   void clearMaster();
 
+  // Push every RaceLink-authoritative override slot into the live WLED
+  // globals (`_targetFps`, `BusManager::_gMilliAmpsMax`, `briS`,
+  // `transitionDelayDefault`, segment geometry) and enforce the
+  // RACELINK_DEFAULT_* values for the non-override settings (gamma,
+  // apBehavior). Called from setup() after the boot-time cfg.json
+  // deserialise AND from readFromConfig() on every subsequent WebUI
+  // Save — so a UI change is live without a reboot. Idempotent. Logs
+  // every value it actually had to write.
+  void applyRaceLinkDefaults();
+
+  // Direct-effect visualisations (replace the legacy preset-11 pair feedback
+  // and provide a boot-time fallback when the operator did not configure a
+  // boot preset).
+  void showPairConfirmedEffect();
+  void showBootRandomColor();
+
+  // Colour-cycle helpers. applyCycleColor() writes colPri + the segment for
+  // a given index (0=R, 1=G, 2=B, >=3=random); applyColorCycleStep() handles
+  // the click-driven advance with idle-window reset.
+  void applyCycleColor(uint8_t idx);
+  void applyColorCycleStep(uint32_t now);
+
+  // Master-contact tracking for the button-quiet gate.
+  bool masterContactedRecently() const;
+  void noteMasterRx();
+
+  // Button (GPIO 0) — custom gesture state machine.
+  void pollPhysicalButton(uint32_t now); // own poll, called from loop()
+  void handleRaceLinkButton(uint8_t b, bool pressed, uint32_t now);
+  void serviceButtonFade(uint32_t now);
+
   // Radio helpers
   bool radioInit();
   //void radioStartRx();
@@ -333,6 +599,13 @@ private:
   void sendAckTo(const uint8_t destLast3[3], uint8_t echoOpcode7, RaceLinkProto::AckStatus st);
   bool sendIdentifyReplyTo(const uint8_t destLast3[3], bool includeFullMac);
   void sendStatusReplyTo(const uint8_t destLast3[3]);
+  // OPC_GET_CONFIG reply (5B body = P_Config). Sent in response to an
+  // OPC_GET_CONFIG request; data0..3 carry the live device-side value of
+  // ``option`` packed per-option per the matching OPC_CONFIG write
+  // command's layout (uint8 / uint16 LE / uint16-pair).
+  void sendGetConfigReplyTo(const uint8_t destLast3[3], uint8_t option,
+                            uint8_t data0, uint8_t data1,
+                            uint8_t data2, uint8_t data3);
   void serviceStartupIdentifyReplies();
 
   // Build frames
