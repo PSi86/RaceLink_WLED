@@ -306,7 +306,7 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
     char debug[16];
     //snprintf(debug, sizeof(debug), "%d", (int)debugCounter);
     snprintf(debug, sizeof(debug), "%d", (int)rl.debug);
-    //snprintf(debug, sizeof(debug), "%d", (int)rl.toaUsMax17/1000U);
+    //snprintf(debug, sizeof(debug), "%d", (int)rl.toaUsMaxPkt/1000U);
     JsonArray row = user.createNestedArray(F("Debug"));
     row.add(debug);
   }
