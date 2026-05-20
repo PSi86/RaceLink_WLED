@@ -1,6 +1,7 @@
 #include "racelink_wled.h"
 //#include <WiFi.h>  // fallback for WiFi.macAddress()
 #include "pin_manager.h"
+#include "rf_config_nvs.h"
 
 #ifdef RACELINK_EPAPER
 #include "racelink_epaper.h"
@@ -8,6 +9,31 @@
 
 static RaceLinkTransport::Core rl{};
 static RaceLinkTransport::Callbacks cb{};
+
+// Currently active LoRa PHY configuration. Initialised in radioInit()
+// from NVS (with compile-time defaults as fallback) and consumed by
+// the PhyCfg builder. Updated by the OPC_RF_CONFIG handler before the
+// queued reboot so a same-boot GET_RF_CONFIG sees the new values.
+static RaceLinkProto::P_RfConfig g_activeRfConfig{};
+
+// Compile-time defaults expressed in the wire-format P_RfConfig layout.
+// Used as the first-boot seed (so a fresh node persists a valid slot
+// before its first OPC_RF_CONFIG) and as the boot-loop recovery target
+// after BOOT_COUNTER_MAX strikes. The WLED-side define names differ
+// from the gateway's (RACELINK_CR / RACELINK_SYNC_WORD vs the
+// gateway's RACELINK_CR_DEN / RACELINK_SYNCWORD), which is why the
+// helper lives at the call site rather than in rf_config_nvs.h.
+static inline RaceLinkProto::P_RfConfig getCompileDefaultRfConfig() {
+  RaceLinkProto::P_RfConfig c{};
+  c.freq_hz       = RACELINK_FREQ_HZ;
+  c.bw_khz_x10    = (uint16_t)(RACELINK_BW_KHZ * 10.0f + 0.5f);
+  c.sf            = RACELINK_SF;
+  c.cr_den        = RACELINK_CR;
+  c.sync_word     = RACELINK_SYNC_WORD;
+  c.tx_power_dbm  = (int8_t)RACELINK_TX_POWER;
+  c.preamble      = RACELINK_PREAMBLE;
+  return c;
+}
 
 // --- Last RX capture (for Info UI) ---
 static uint8_t lastRxRaw[64];
@@ -794,17 +820,43 @@ bool UsermodRaceLink::radioInit() {
   
   radio = &r;
 
+  // ---- RF config bring-up (NVS-backed, runtime-tunable since Stage 1 PR-3)
+  //
+  // Boot-loop recovery: tick the counter BEFORE radio.begin(). If
+  // we've hit BOOT_COUNTER_MAX strikes the persisted slot is presumed
+  // to be bricking the node (e.g. SF too high for the environment, or
+  // a freq the master can no longer reach). Wipe the slot now; the
+  // next load() returns false and we fall through to compile
+  // defaults below.
+  const uint8_t bootStrikes = RfConfigNvs::bootCounterIncrement();
+  if (bootStrikes > RfConfigNvs::BOOT_COUNTER_MAX) {
+    RfConfigNvs::wipe();
+  }
+
+  // Load the active config. Order of preference:
+  //   1) Validated NVS slot (operator-set via OPC_RF_CONFIG, survives
+  //      reboots).
+  //   2) Compile-time defaults (RACELINK_FREQ_HZ etc.). On first boot
+  //      we additionally persist these defaults so OPC_GET_RF_CONFIG
+  //      always returns a complete picture and so the operator can
+  //      pivot via a normal SET without first probing for "is anything
+  //      there yet".
+  if (!RfConfigNvs::load(g_activeRfConfig)) {
+    g_activeRfConfig = getCompileDefaultRfConfig();
+    RfConfigNvs::store(g_activeRfConfig);
+  }
+
   RaceLinkTransport::PhyCfg phy;
-  phy.freqMHz   = (float)(RACELINK_FREQ_HZ/1e6f);
-  phy.bwKHz     = RACELINK_BW_KHZ;
-  phy.sf        = RACELINK_SF;
-  phy.crDen     = RACELINK_CR;
-  phy.syncWord  = RACELINK_SYNC_WORD;
-  phy.preamble  = RACELINK_PREAMBLE;
+  phy.freqMHz   = (float)g_activeRfConfig.freq_hz / 1e6f;
+  phy.bwKHz     = (float)g_activeRfConfig.bw_khz_x10 / 10.0f;
+  phy.sf        = g_activeRfConfig.sf;
+  phy.crDen     = g_activeRfConfig.cr_den;
+  phy.syncWord  = g_activeRfConfig.sync_word;
+  phy.preamble  = g_activeRfConfig.preamble;
   phy.crcOn     = true;
 
   // C3 / HT-CT62 specific:
-  phy.txPowerDbm   = RACELINK_TX_POWER;        // override default
+  phy.txPowerDbm   = g_activeRfConfig.tx_power_dbm;
   phy.dio2RfSwitch = 1;                    // SX1262 (HT-CT62) or also LLCC68 (DreamLNK)
   phy.rxBoost      = -1;                   // or 1/0 depending on board tests
 
@@ -814,10 +866,16 @@ bool UsermodRaceLink::radioInit() {
   //rl.radio = radio;
 
   rl.lbtEnable = true;   // default: false
-  
+
   RaceLinkTransport::attachDio1(*radio, rl);
 
   RaceLinkTransport::setDefaultRxContinuous(rl); // *** IMPORTANT: enable continuous RX via RL ***
+
+  // Radio came up cleanly -- reset the strike counter so the next
+  // clean boot starts at zero. A hang inside beginCommon() above
+  // would leave the counter ticked, and the next boot (after the
+  // operator power-cycles) re-enters the recovery branch.
+  RfConfigNvs::bootCounterClear();
 
   return true;
 }
@@ -1820,6 +1878,85 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       DEBUG_PRINTF_P(PSTR("[RaceLink] INDICATE -> type=%u dur=%us\n"),
                      (unsigned)p.type, (unsigned)p.durationSec);
     } break;
+
+    case OPC_RF_CONFIG: { // Write LoRa PHY config (12 B P_RfConfig)
+      // Unicast-only by design: a broadcast OPC_RF_CONFIG would knock
+      // every reachable node off-channel simultaneously and brick the
+      // fleet. The wire-level rule lives in racelink_proto.h; we
+      // enforce it again here so a future broadcast-permitting rules
+      // table change doesn't silently brick anyone.
+      if (RaceLinkTransport::isBroadcast3(h.receiver)) {
+        DEBUG_PRINTLN(F("[RaceLink] RF_CONFIG -> broadcast rejected"));
+        break;
+      }
+      P_RfConfig p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+
+      // Range validation: out-of-band freq, unsupported BW / SF / CR /
+      // TX power / preamble all NACK with ACK_BAD_LEN. We could carry
+      // a richer reason via P_Ack.status, but the host already
+      // distinguishes "rejected by node" (any non-OK ACK) from
+      // "node unreachable" (no ACK at all), so the existing status
+      // space is sufficient.
+      const auto reason = RfConfigNvs::validate(p);
+      if (reason != RaceLinkProto::RF_CHANGE_OK) {
+        sendAckTo(h.sender, OPC_RF_CONFIG, ACK_BAD_LEN);
+        DEBUG_PRINTF_P(PSTR("[RaceLink] RF_CONFIG -> NACK reason=%u\n"),
+                       (unsigned)reason);
+        acted = true;
+        break;
+      }
+
+      // Persist before ACK so a tight-timed reboot can't drop the
+      // write. store() defensively re-validates; we treat any non-OK
+      // result here as NVS failure (the only remaining failure mode).
+      if (RfConfigNvs::store(p) != RaceLinkProto::RF_CHANGE_OK) {
+        sendAckTo(h.sender, OPC_RF_CONFIG, ACK_ERROR);
+        DEBUG_PRINTLN(F("[RaceLink] RF_CONFIG -> NVS write failed"));
+        acted = true;
+        break;
+      }
+
+      // Update the in-RAM mirror so a same-boot OPC_GET_RF_CONFIG read
+      // before reboot reflects the freshly persisted values.
+      g_activeRfConfig = p;
+
+      sendAckTo(h.sender, OPC_RF_CONFIG, ACK_OK);
+      acted = true;
+      DEBUG_PRINTF_P(PSTR("[RaceLink] RF_CONFIG -> stored, rebooting (freq=%lu sf=%u bw=%u sw=0x%02X)\n"),
+                     (unsigned long)p.freq_hz, (unsigned)p.sf,
+                     (unsigned)p.bw_khz_x10, (unsigned)p.sync_word);
+
+      // Apply the new PHY by rebooting -- radioInit() in setup() will
+      // reload NVS on the way back up. RadioLib has no clean "reset
+      // PHY mid-flight" path on a node that may be in the middle of a
+      // streaming RX, and a node-side reboot is operator-visible (a
+      // brief outage on a single device) rather than fleet-wide. The
+      // 50 ms delay lets the ACK frame finish leaving the radio
+      // before the SoC restarts.
+      delay(50);
+      ESP.restart();
+      // not reached
+    } break;
+
+    case OPC_GET_RF_CONFIG: { // Read-back of the active PHY config
+      if (RaceLinkTransport::isBroadcast3(h.receiver)) {
+        // Unicast-only: a broadcast read-back would have every node
+        // reply simultaneously and saturate the channel.
+        break;
+      }
+      P_GetRfConfig p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+      if (p.reserved != 0) {
+        // Reserved must be 0 today (future channel-slot selector).
+        // Non-zero is a structurally invalid request -- no reply,
+        // matching how OPC_GET_CONFIG handles unknown options.
+        break;
+      }
+      sendRfConfigReplyTo(h.sender);
+      acted = true;
+      DEBUG_PRINTLN(F("[RaceLink] GET_RF_CONFIG -> reply sent"));
+    } break;
   }
 
   if (acted) rxAccepted++;
@@ -1952,6 +2089,23 @@ void UsermodRaceLink::sendGetConfigReplyTo(const uint8_t destLast3[3], uint8_t o
 
   uint8_t t = make_type(DIR_N2M, OPC_GET_CONFIG);
   uint8_t n = build(out, rl.myLast3, destLast3, t, p);
+
+  RaceLinkTransport::scheduleSend(rl, out, n);
+}
+
+void UsermodRaceLink::sendRfConfigReplyTo(const uint8_t destLast3[3]) {
+  // GET_RF_CONFIG_REPLY: same opcode as the request with the N2M
+  // direction bit and a P_RfConfig-shaped body (12 B). Reuses the
+  // standard build() helper so the byte layout matches the
+  // OPC_RF_CONFIG write frame on the wire. Returns the in-RAM
+  // g_activeRfConfig, which mirrors the persisted NVS slot 1:1 after
+  // radioInit() (and equals the freshly-persisted value during the
+  // tiny window between an OPC_RF_CONFIG ACK and the ESP.restart()).
+  using namespace RaceLinkProto;
+  uint8_t out[32];
+
+  uint8_t t = make_type(DIR_N2M, OPC_GET_RF_CONFIG);
+  uint8_t n = build(out, rl.myLast3, destLast3, t, g_activeRfConfig);
 
   RaceLinkTransport::scheduleSend(rl, out, n);
 }

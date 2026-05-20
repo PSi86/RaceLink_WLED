@@ -799,6 +799,13 @@ private:
   void sendGetConfigReplyTo(const uint8_t destLast3[3], uint8_t option,
                             uint8_t data0, uint8_t data1,
                             uint8_t data2, uint8_t data3);
+  // OPC_GET_RF_CONFIG reply (12B body = P_RfConfig). Sent in response
+  // to an OPC_GET_RF_CONFIG read-back from the host. The body carries
+  // the node's currently active LoRa PHY config (the NVS-persisted
+  // values that radioInit() applied at boot, plus any subsequent
+  // OPC_RF_CONFIG-driven changes that will take effect after the
+  // queued reboot).
+  void sendRfConfigReplyTo(const uint8_t destLast3[3]);
   void serviceStartupIdentifyReplies();
 
   // Build frames
