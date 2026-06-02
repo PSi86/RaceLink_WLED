@@ -191,6 +191,14 @@ void UsermodRaceLink::setup() {
   
   #ifdef RACELINK_EPAPER
     {
+      #ifdef RACELINK_EPAPER_VEXT
+        // Power the e-ink rail before any SPI/init activity (Heltec Wireless Paper:
+        // Vext on GPIO 45, active LOW). Held for the lifetime of the device.
+        pinMode(RACELINK_EPAPER_VEXT, OUTPUT);
+        digitalWrite(RACELINK_EPAPER_VEXT, RACELINK_EPAPER_VEXT_ON);
+        PinManager::allocatePin(RACELINK_EPAPER_VEXT, true, PinOwner::UM_Unspecified);
+        delay(10); // let the e-ink supply settle before SPI init
+      #endif
       const PinManagerPinType epdPins[] = {
         { epdSck,  true  },
         { epdMosi, true  },
@@ -204,7 +212,7 @@ void UsermodRaceLink::setup() {
                                            sizeof(epdPins) / sizeof(epdPins[0]),
                                            PinOwner::UM_Unspecified)) {
         epaperInit(epdMosi, epdSck, epdMiso, epdCs, epdDc, epdRst, epdBusy);
-        #if DEV_TYPE == 50
+        #if defined(RACELINK_STARTBLOCK)
           setDisplayLayout(numberOfSlots);
         #endif
       } else {
@@ -508,7 +516,7 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
   top["macFilterEnabled"] = macFilterEnabled;  // default ON
   top["macFilterPersist"] = macFilterPersist;  // default OFF
 
-  #if DEV_TYPE == 50
+  #if defined(RACELINK_STARTBLOCK)
     top[F("Number of Slots (1-8)")] = numberOfSlots;
     top[F("First Slot (1-8)")] = firstSlot;
   #endif
@@ -644,7 +652,7 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
   getJsonValue(top["macFilterEnabled"], macFilterEnabled, true);
   getJsonValue(top["macFilterPersist"], macFilterPersist, false);
 
-  #if DEV_TYPE == 50
+  #if defined(RACELINK_STARTBLOCK)
     uint8_t slots = numberOfSlots;
     uint8_t first = firstSlot;
     getJsonValue(top[F("Number of Slots (1-8)")], slots, 1);
@@ -1544,7 +1552,7 @@ bool UsermodRaceLink::handleStreamPacket(const uint8_t* buf, uint8_t len, const 
 #ifdef RACELINK_EPAPER
     bool slotValid = true;
     uint8_t displaySlot = startblock.slot;
-    #if DEV_TYPE == 50
+    #if defined(RACELINK_STARTBLOCK)
       const uint8_t slotCount = constrain(numberOfSlots, (uint8_t)1, (uint8_t)8);
       const uint8_t slotFirst = constrain(firstSlot, (uint8_t)1, (uint8_t)8);
       if (startblock.slot < slotFirst || startblock.slot >= (uint8_t)(slotFirst + slotCount)) {
@@ -1913,7 +1921,7 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       } else if (p.option == 0x81) { // Reboot Node
         if (p.data0 != 0) doReboot = true;
       }
-      #if DEV_TYPE == 50
+      #if defined(RACELINK_STARTBLOCK)
       else if (p.option == 0x8C) { // Number of Slots
         const uint8_t value = constrain(p.data0, (uint8_t)1, (uint8_t)8);
         if (numberOfSlots != value) {
@@ -1995,7 +2003,7 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
           const uint16_t ms = transitionDelayDefault;
           d0 = (uint8_t)(ms & 0xFF); d1 = (uint8_t)(ms >> 8);
         } break;
-        #if DEV_TYPE == 50
+        #if defined(RACELINK_STARTBLOCK)
         case 0x8C: { // STARTBLOCK: number of slots
           d0 = numberOfSlots;
         } break;

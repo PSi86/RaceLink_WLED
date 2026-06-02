@@ -12,6 +12,8 @@ SHIPPING_PROFILE_FILENAMES = (
     "RaceLink_Node_v3_s2_llcc68.platformio_override.ini",
     "RaceLink_Node_v3_s2_llcc68_epaper.platformio_override.ini",
     "RaceLink_Node_v4_s3_llcc68.platformio_override.ini",
+    "RaceLink_Node_v5_s3_eth.platformio_override.ini",
+    "RaceLink_Node_v6_s3_heltec_wpaper.platformio_override.ini",
 )
 
 USERMOD_LINE_PATTERN = re.compile(r"^(?P<prefix>\s*custom_usermods\s*=\s*)(?P<value>.*)$")
