@@ -218,6 +218,23 @@ enum GateStatusCfgFlags : uint8_t {
   #ifndef RACELINK_EPAPER_MISO
     #define RACELINK_EPAPER_MISO -1
   #endif
+  // Optional external power switch for the e-ink rail (e.g. Heltec Wireless Paper
+  // Vext on GPIO 45). Leave RACELINK_EPAPER_VEXT undefined on panels that are
+  // always powered. When defined, the pin is driven to RACELINK_EPAPER_VEXT_ON
+  // (default LOW = active-low enable) at boot, just before epaperInit().
+  #if defined(RACELINK_EPAPER_VEXT) && !defined(RACELINK_EPAPER_VEXT_ON)
+    #define RACELINK_EPAPER_VEXT_ON 0
+  #endif
+#endif
+
+// ------------ RaceLink Startblock device class ------------
+// DEV_TYPE 50 (v3 e-paper node) and 51 (v6 Heltec Wireless Paper) are both
+// "Startblock" devices: they expose the pilot-slot config (numberOfSlots /
+// firstSlot), filter incoming per-slot data, and render the per-slot e-paper
+// layout. Gate all of that on RACELINK_STARTBLOCK so adding another Startblock
+// board stays a one-line change here.
+#if (DEV_TYPE == 50) || (DEV_TYPE == 51)
+  #define RACELINK_STARTBLOCK 1
 #endif
 
 // ------------ RaceLink RaceLink defaults (EU868) ------------
@@ -646,7 +663,7 @@ private:
   uint8_t startupIdentifyStage = 0;
   uint32_t startupIdentifyAtMs[2] = {0, 0};
 
-  #if DEV_TYPE == 50
+  #if defined(RACELINK_STARTBLOCK)
     uint8_t numberOfSlots = 1;
     uint8_t firstSlot = 1;
   #endif

@@ -101,10 +101,34 @@ GxEPD2_370_GDEY037T03.h:
 // inherits the constructor and exposes a setPins() method so we can apply
 // runtime-configured pin numbers before display.init() is called. This avoids
 // reaching into protected members via static_cast tricks (which would be UB).
-class GxEPD2_370_GDEY037T03_Configurable : public GxEPD2_370_GDEY037T03
+//
+// The concrete panel class is selected at compile time. Heltec ships the
+// Wireless Paper with TWO different 2.13" 250x122 panels (the factory firmware
+// auto-detects); pick the one matching the board:
+//   - RACELINK_EPAPER_PANEL_E0213A367 -> GxEPD2_213_E0213A367 (controller SSD1682).
+//   - RACELINK_EPAPER_PANEL_FC1        -> GxEPD2_213_FC1 (Fitipower JD79656,
+//     panel LCMEN2R13EFC1).
+//   - default                          -> GxEPD2_370_GDEY037T03 (3.7" 240x416, UC8253).
+// The two 2.13" classes live ONLY in the Meshtastic GxEPD2 fork (pinned by the
+// build profile's lib_deps). Their constructors take an extra SPIClass& (passed
+// here as the already-declared static epdSPI), and their GxEPD2_EPD base predates
+// selectSPI() and needs initial=true on the cold init -- both keyed off
+// RACELINK_EPAPER_FORK_PANEL (see the worker init below). All panels derive from
+// GxEPD2_EPD, so the setPins() pattern and the render flow are identical.
+#if defined(RACELINK_EPAPER_PANEL_E0213A367)
+  #define RACELINK_EPAPER_BASE_PANEL GxEPD2_213_E0213A367
+  #define RACELINK_EPAPER_FORK_PANEL 1
+#elif defined(RACELINK_EPAPER_PANEL_FC1)
+  #define RACELINK_EPAPER_BASE_PANEL GxEPD2_213_FC1
+  #define RACELINK_EPAPER_FORK_PANEL 1
+#else
+  #define RACELINK_EPAPER_BASE_PANEL GxEPD2_370_GDEY037T03
+#endif
+
+class GxEPD2_Panel_Configurable : public RACELINK_EPAPER_BASE_PANEL
 {
 public:
-  using GxEPD2_370_GDEY037T03::GxEPD2_370_GDEY037T03;   // inherit constructors
+  using RACELINK_EPAPER_BASE_PANEL::RACELINK_EPAPER_BASE_PANEL;   // inherit constructors
   void setPins(int16_t cs, int16_t dc, int16_t rst, int16_t busy)
   {
     _cs   = cs;
@@ -117,10 +141,18 @@ public:
 // Instantiate with -1 placeholder pins. The real pin numbers are written by
 // epaperInit() into display.epd2.setPins() *before* the worker task calls
 // display.init(); this is safe because GxEPD2_EPD's constructor only stores
-// the pin numbers — no pinMode / digitalWrite happens until init() runs.
-static GxEPD2_BW<GxEPD2_370_GDEY037T03_Configurable, GxEPD2_370_GDEY037T03_Configurable::HEIGHT> display(
- GxEPD2_370_GDEY037T03_Configurable(/*CS=*/ -1, /*DC=*/ -1, /*RES=*/ -1, /*BUSY=*/ -1)
+// the pin numbers — no pinMode / digitalWrite happens until init() runs. The
+// fork panels additionally require an SPIClass& at construction (epdSPI, which
+// is a static declared above this point, so it is fully constructed first).
+#if defined(RACELINK_EPAPER_FORK_PANEL)
+static GxEPD2_BW<GxEPD2_Panel_Configurable, GxEPD2_Panel_Configurable::HEIGHT> display(
+ GxEPD2_Panel_Configurable(/*CS=*/ -1, /*DC=*/ -1, /*RES=*/ -1, /*BUSY=*/ -1, epdSPI)
 );
+#else
+static GxEPD2_BW<GxEPD2_Panel_Configurable, GxEPD2_Panel_Configurable::HEIGHT> display(
+ GxEPD2_Panel_Configurable(/*CS=*/ -1, /*DC=*/ -1, /*RES=*/ -1, /*BUSY=*/ -1)
+);
+#endif
 
 // -----------------------------
 // State
@@ -476,8 +508,23 @@ static void epaperTask(void* /*arg*/)
       display.epd2.setPins(g_epdCs, g_epdDc, g_epdRst, g_epdBusy_pin);
 
       epdSPI.begin(g_epdSck, g_epdMiso, g_epdMosi, g_epdCs);
-      display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
-      display.init(115200, false, 50, false); // reset duration was 50
+      #if defined(RACELINK_EPAPER_FORK_PANEL)
+        // The 2.13" fork panels (FC1 / E0213A367) sit on a GxEPD2 1.3.x base that
+        // predates GxEPD2_EPD::selectSPI(); they bind the SPI bus + settings via
+        // the constructor instead (we passed epdSPI above), so the begun bus is
+        // already wired up — nothing to select here.
+        //
+        // Cold power-up MUST use initial=true: in GxEPD2, init() only runs the
+        // pin setup + hardware _reset() when initial==true. With initial=false
+        // the panel is never reset, so its soft-reset BUSY never releases
+        // (6 s timeout per op, blank panel). This mirrors Meshtastic's
+        // adafruitDisplay->init() (initial defaults to true). The post-hibernate
+        // wake in wakeIfNeeded() keeps initial=false (no reset needed).
+        display.init(115200, /*initial=*/true, 50, false);
+      #else
+        display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
+        display.init(115200, false, 50, false); // existing GDEY037T03 behavior (reset duration 50)
+      #endif
       g_hibernated = false;
 
       renderStartScreen();
