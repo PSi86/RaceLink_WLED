@@ -1,7 +1,14 @@
 #pragma once
 
 #include "wled.h"
-#include "racelink_transport_core.h"
+// Transport backend selector: Ethernet (W5500/UDP) when built with
+// -D RACELINK_ETH, otherwise the LoRa/RadioLib backend. Both expose the same
+// RaceLinkTransport:: surface, so the rest of the usermod is medium-agnostic.
+#if defined(RACELINK_ETH)
+  #include "racelink_transport_eth.h"
+#else
+  #include "racelink_transport_core.h"
+#endif
 #include "racelink_headless.h"
 #include "racelink_indicators.h"
 //#include "racelink_proto.h"
@@ -326,7 +333,9 @@ private:
 
   // Radio / SPI
   SPIClass* spi = &SPI;
-  #if defined(RACELINK_SX1262)
+  #if defined(RACELINK_ETH)
+    // No radio on Ethernet builds; readiness is tracked via radioReady.
+  #elif defined(RACELINK_SX1262)
     SX1262* radio = nullptr;
   #elif defined(RACELINK_LLCC68)
     LLCC68* radio = nullptr;
@@ -345,6 +354,18 @@ private:
   int8_t pinDio1 = RACELINK_PIN_DIO1;
   int8_t pinBusy = RACELINK_PIN_BUSY;
   int8_t pinRst  = RACELINK_PIN_RST;
+
+  #if defined(RACELINK_ETH)
+  // W5500 SPI pins — runtime-configurable in the usermod settings, exactly like
+  // the LoRa radio pins above. A change in the UI sets doReboot; the W5500 is
+  // re-init'd at boot with the saved values (build-flag macros are the defaults).
+  int8_t ethSclk = RACELINK_ETH_SCLK;
+  int8_t ethMosi = RACELINK_ETH_MOSI;
+  int8_t ethMiso = RACELINK_ETH_MISO;
+  int8_t ethCs   = RACELINK_ETH_CS;
+  int8_t ethRst  = RACELINK_ETH_RST;
+  int8_t ethInt  = RACELINK_ETH_INT;
+  #endif
 
   #ifdef RACELINK_EPAPER
     // ePaper SPI bus + control pins. CS/DC/RST/BUSY are written into the

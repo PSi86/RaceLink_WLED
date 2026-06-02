@@ -269,7 +269,11 @@ void UsermodRaceLink::loop() {
   serviceSceneRebroadcast(nowMs);
   serviceIndicator(nowMs);
 
+#if defined(RACELINK_ETH)
+  if (!radioReady) return;
+#else
   if (!radio) return;
+#endif
 
   // replaces the previous flag-/ISR-/onRx() handling
   RaceLinkTransport::service(rl, cb);
@@ -298,13 +302,36 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
   JsonObject user = root["u"];
   if (user.isNull()) user = root.createNestedObject("u");
 
-  // RaceLink Init
+#if defined(RACELINK_ETH)
+  // Ethernet link + IP status (replaces the LoRa radio-init line).
+  {
+    char eth[48];
+    if (radioReady) {
+      // Read the PHY link state on demand (only when the info panel renders).
+      snprintf(eth, sizeof(eth), "%s  %u.%u.%u.%u (%s)",
+               rl.w5500.linkUp() ? "LINK UP" : "no link",
+               rl.ip[0], rl.ip[1], rl.ip[2], rl.ip[3],
+               rl.dhcpOk ? "DHCP" : "static");
+    } else {
+      snprintf(eth, sizeof(eth), "INIT FAIL (code %d)", (int)radioInitCode);
+    }
+    JsonArray row = user.createNestedArray(F("RaceLink ETH"));
+    row.add(eth);
+  }
+  // UDP node port (the W5500 pins live in the usermod settings, not here).
+  {
+    char p[12]; snprintf(p, sizeof(p), "%u", (unsigned)rl.nodePort);
+    user.createNestedArray(F("ETH UDP Port")).add(p);
+  }
+#else
+  // RaceLink Init (radio)
   {
     char initMsg[32];
     snprintf(initMsg, sizeof(initMsg), "%s (code %d)", radioReady ? "OK" : "FAIL", (int)radioInitCode);
     JsonArray row = user.createNestedArray(F("RaceLink Init"));
     row.add(initMsg);
   }
+#endif
 
   // MyID 3B
   {
@@ -326,13 +353,15 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
     row3.add(String((unsigned long)rl.txCount));
   }
 
-  // Last RSSI/SNR
+#ifndef RACELINK_ETH
+  // Last RSSI/SNR (LoRa only; meaningless on Ethernet)
   {
     char sig[24];
     snprintf(sig, sizeof(sig), "%d / %d", (int)rl.lastRssi, (int)rl.lastSnr);
     JsonArray row = user.createNestedArray(F("Last RSSI/SNR"));
     row.add(sig);
   }
+#endif
 
   {
     JsonArray row = user.createNestedArray(F("Last RX"));
@@ -501,7 +530,8 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
           persistedMasterFull6[3], persistedMasterFull6[4], persistedMasterFull6[5]);
   top["masterFullMac"] = persistedMasterFull6Known ? String(m6) : String("");
 
-  // radio defaults
+#ifndef RACELINK_ETH
+  // radio defaults (LoRa builds only)
   JsonObject l = top.createNestedObject("RL_RF");
   l["freq"] = RACELINK_FREQ_HZ;
   l["sf"]   = RACELINK_SF;
@@ -522,6 +552,19 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
   pins[F("DIO1")] = pinDio1;
   pins[F("BUSY")] = pinBusy;
   pins[F("RST")]  = pinRst;
+#else
+  // Ethernet (W5500) builds: the SPI pins are runtime-configurable here, exactly
+  // like the LoRa radio pins. Saved values load into eth* members in
+  // readFromConfig() and apply when radioInit() runs at the next boot. (UDP
+  // ports and DHCP/static IP mode remain compile-time RACELINK_ETH_* build flags.)
+  JsonObject ethPins = top.createNestedObject("eth_pins");
+  ethPins[F("SCLK")] = ethSclk;
+  ethPins[F("MOSI")] = ethMosi;
+  ethPins[F("MISO")] = ethMiso;
+  ethPins[F("CS")]   = ethCs;
+  ethPins[F("RST")]  = ethRst;
+  ethPins[F("INT")]  = ethInt;
+#endif
 
   #ifdef RACELINK_EPAPER
     JsonObject ep = top.createNestedObject("epaper_pins");
@@ -659,6 +702,7 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
   }
   // When persistence is off: do NOT overwrite runtime values
 
+#ifndef RACELINK_ETH
   // RaceLink radio pins. Capture old values to detect a UI change so we can
   // request a reboot (SPI re-init at runtime is not supported by design).
   // On the very first call (boot-time deserialize), suppress the reboot —
@@ -714,6 +758,30 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
     DEBUG_PRINTLN(F("[RaceLink] Pin config changed — rebooting to apply"));
     doReboot = true;
   }
+#endif // !RACELINK_ETH
+
+#if defined(RACELINK_ETH)
+  // W5500 SPI pins (runtime-configurable, parity with the LoRa radio pins). A
+  // change requires a reboot to re-init SPI/Ethernet; suppressed on first boot.
+  const int8_t oldEthSclk = ethSclk, oldEthMosi = ethMosi, oldEthMiso = ethMiso,
+               oldEthCs = ethCs, oldEthRst = ethRst, oldEthInt = ethInt;
+  {
+    JsonObject ep = top["eth_pins"];
+    getJsonValue(ep[F("SCLK")], ethSclk, RACELINK_ETH_SCLK);
+    getJsonValue(ep[F("MOSI")], ethMosi, RACELINK_ETH_MOSI);
+    getJsonValue(ep[F("MISO")], ethMiso, RACELINK_ETH_MISO);
+    getJsonValue(ep[F("CS")],   ethCs,   RACELINK_ETH_CS);
+    getJsonValue(ep[F("RST")],  ethRst,  RACELINK_ETH_RST);
+    getJsonValue(ep[F("INT")],  ethInt,  RACELINK_ETH_INT);
+  }
+  const bool ethPinsChanged = (oldEthSclk != ethSclk) || (oldEthMosi != ethMosi) ||
+                              (oldEthMiso != ethMiso) || (oldEthCs   != ethCs)   ||
+                              (oldEthRst  != ethRst)  || (oldEthInt  != ethInt);
+  if (ethPinsChanged && !firstReadFromConfig) {
+    DEBUG_PRINTLN(F("[RaceLink] ETH pin config changed — rebooting to apply"));
+    doReboot = true;
+  }
+#endif
   firstReadFromConfig = false;
 
   // RaceLink-authoritative overrides. Slots are always present in cfg.json
@@ -816,6 +884,40 @@ void UsermodRaceLink::refreshFieldsFromSegment() {
 
 // ========= Radio =========
 bool UsermodRaceLink::radioInit() {
+#if defined(RACELINK_ETH)
+  // Ethernet (W5500/UDP) bring-up. SPI pins, RST and the UDP node port come
+  // from the RACELINK_ETH_* build flags (defaults in racelink_transport_eth.h).
+  //
+  // Reserve the W5500 pins via WLED's PinManager so a misconfigured LED bus on
+  // any of them fails loudly here instead of silently breaking the link. SCLK/
+  // MOSI/CS/RST are driven (output); MISO and INT are inputs.
+  const PinManagerPinType ethPins[] = {
+    { ethSclk, true  },
+    { ethMosi, true  },
+    { ethMiso, false },
+    { ethCs,   true  },
+    { ethRst,  true  },
+    { ethInt,  false },
+  };
+  if (!PinManager::allocateMultiplePins(ethPins, sizeof(ethPins) / sizeof(ethPins[0]),
+                                        PinOwner::UM_Unspecified)) {
+    DEBUG_PRINTLN(F("[RaceLink] W5500 pin allocation failed (LED bus conflict?)"));
+    radioInitCode = -998;
+    return false;
+  }
+
+  // Bring up the W5500 on the runtime-configured pins (UI/cfg.json overrides the
+  // RACELINK_ETH_* build-flag defaults; node port stays compile-time).
+  RaceLinkTransport::EthCfg ethCfg;
+  ethCfg.sclk = ethSclk; ethCfg.mosi = ethMosi; ethCfg.miso = ethMiso;
+  ethCfg.cs = ethCs; ethCfg.rst = ethRst; ethCfg.irq = ethInt;
+  ethCfg.nodePort = RACELINK_ETH_NODE_PORT;
+  radioInitCode = RaceLinkTransport::beginCommon(rl, ethCfg) ? 0 : -999;
+  if (radioInitCode != 0) return false;
+  rl.lbtEnable = false;                            // no LBT on a wired medium
+  RaceLinkTransport::setDefaultRxContinuous(rl);   // no-op on Ethernet
+  return true;
+#else
   // Allocate radio pins via WLED's PinManager so a misconfigured LED bus on
   // any of these pins fails loudly here instead of silently breaking SPI.
   // MISO is allowed to be -1 (some modules omit it). Skip it from the alloc
@@ -908,6 +1010,7 @@ bool UsermodRaceLink::radioInit() {
   RfConfigNvs::bootCounterClear();
 
   return true;
+#endif
 }
 
 bool UsermodRaceLink::senderAllowed(const uint8_t s3[3], uint8_t opcode7) {
@@ -1937,6 +2040,14 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
     } break;
 
     case OPC_RF_CONFIG: { // Write LoRa PHY config (12 B P_RfConfig)
+#if defined(RACELINK_ETH)
+      // No LoRa PHY on Ethernet builds — reject (unicast) so the node never
+      // reboots onto a meaningless config. The host's EthernetTransport does
+      // not send OPC_RF_CONFIG to Ethernet nodes.
+      if (!RaceLinkTransport::isBroadcast3(h.receiver))
+        sendAckTo(h.sender, OPC_RF_CONFIG, ACK_BAD_TYPE);
+      break;
+#else
       // Unicast-only by design: a broadcast OPC_RF_CONFIG would knock
       // every reachable node off-channel simultaneously and brick the
       // fleet. The wire-level rule lives in racelink_proto.h; we
@@ -2008,9 +2119,16 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       delay(50);
       ESP.restart();
       // not reached
+#endif // !RACELINK_ETH
     } break;
 
     case OPC_GET_RF_CONFIG: { // Read-back of the active PHY config
+#if defined(RACELINK_ETH)
+      // No persisted PHY config on Ethernet builds — reject (unicast).
+      if (!RaceLinkTransport::isBroadcast3(h.receiver))
+        sendAckTo(h.sender, OPC_GET_RF_CONFIG, ACK_BAD_TYPE);
+      break;
+#else
       if (RaceLinkTransport::isBroadcast3(h.receiver)) {
         // Unicast-only: a broadcast read-back would have every node
         // reply simultaneously and saturate the channel.
@@ -2027,6 +2145,7 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       sendRfConfigReplyTo(h.sender);
       acted = true;
       DEBUG_PRINTLN(F("[RaceLink] GET_RF_CONFIG -> reply sent"));
+#endif // !RACELINK_ETH
     } break;
   }
 
