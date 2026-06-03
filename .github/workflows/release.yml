@@ -132,12 +132,18 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           : > dist/built_envs.txt
-          profiles=(
-            "build_profiles/RaceLink_Node_v1_c3_ct62.platformio_override.ini"
-            "build_profiles/RaceLink_Node_v3_s2_llcc68.platformio_override.ini"
-            "build_profiles/RaceLink_Node_v3_s2_llcc68_epaper.platformio_override.ini"
-            "build_profiles/RaceLink_Node_v4_s3_llcc68.platformio_override.ini"
+          # Single source of truth: SHIPPING_PROFILE_FILENAMES in
+          # scripts/release_profiles.py (via iter_shipping_profiles, which also
+          # validates each file exists). Keep this in sync by editing that tuple
+          # only -- do NOT hard-code the profile list here.
+          mapfile -t profiles < <(
+            python -c "from pathlib import Path; from scripts.release_profiles import iter_shipping_profiles; [print('build_profiles/' + p.name) for p in iter_shipping_profiles(Path('build_profiles'))]"
           )
+          if [ "${#profiles[@]}" -eq 0 ]; then
+            echo "No shipping profiles resolved from SHIPPING_PROFILE_FILENAMES"
+            exit 1
+          fi
+          printf 'Shipping profiles to build:\n'; printf '  %s\n' "${profiles[@]}"
 
           for profile in "${profiles[@]}"; do
             rm -rf external/WLED/build_output/release
