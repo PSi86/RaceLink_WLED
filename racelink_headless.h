@@ -23,6 +23,12 @@ namespace RaceLinkHeadless {
 // -------------------- Probe / activation constants --------------------
 // All times in milliseconds; tuned for SF7/125k EU868 latency budget.
 
+// NOTE: the HEADLESS_PROBE_* constants and buildIdentifyProbe() below are no
+// longer used by the firmware. The 5-click promotion now decides immediately
+// via masterContactedRecently() (same gate as standalone control) with the
+// runtime master-alive detector as the safety net — no probe window. Kept
+// for wire/source compatibility with any external includer of this header.
+
 // Window in which a Gateway / other Headless Master may answer our
 // probe-IDENTIFY_REPLY with OPC_SET_GROUP. Measured from the moment the
 // first probe is actually sent.
@@ -352,15 +358,8 @@ inline uint8_t nextSceneIdx(uint8_t currentIdx) {
 // class; an external Gateway-side driver would manage its own copy.
 struct HeadlessState {
   bool     active             = false;   // currently running as Headless Master
-  bool     probing            = false;   // probe window open, decision pending
-  bool     probeAborted       = false;   // an OPC_SET_GROUP arrived during the probe — abort
   uint8_t  currentSceneIdx    = 0xFF;    // index into SCENE_CATALOG (0xFF = none)
   uint8_t  broadcastBri       = 128;     // last-known fleet brightness
-  uint32_t probeStartedAtMs   = 0;       // millis() when probe window opened (first send)
-  uint32_t probeFirstSendAtMs = 0;       // scheduled local time for the first probe send
-  uint32_t probeSecondSendAtMs= 0;       // scheduled local time for the second probe send
-  bool     probeFirstSent     = false;
-  bool     probeSecondSent    = false;
   uint32_t lastBroadcastAtMs  = 0;       // last time we emitted ANY headless packet (for keepalive)
 };
 

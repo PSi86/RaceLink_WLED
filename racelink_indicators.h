@@ -32,6 +32,9 @@ enum IndicatorType : uint8_t {
   IND_HEADLESS_EXIT  = 3,   // magenta breathe — step-down from headless (5-click or gateway takeover)
   IND_IDENTIFY       = 4,   // magenta strobe — operator-triggered "where is this device?" from the host UI
   IND_PAIRING_TX     = 5,   // green-cyan strobe — Headless master sent a SET_GROUP packet (pairing TX)
+  IND_AP_ENABLED     = 6,   // violet strobe — WiFi Access Point opened (3-click toggle or OPC_CONFIG 0x04)
+  IND_AP_DISABLED    = 7,   // warm strobe — WiFi Access Point closed (3-click toggle or OPC_CONFIG 0x04)
+  IND_ACTION_LOCKED  = 8,   // orange strobe — local button action refused because a master is in control
   // Add new rows below in append-only fashion. Always animated.
 };
 
@@ -94,6 +97,16 @@ static const IndicatorDef INDICATOR_CATALOG[] = {
   // rather than a sustained state overlay. Brightness 200 trades a small
   // amount of visibility for less eye fatigue during 40-slave re-bind bursts.
   { IND_PAIRING_TX,       "Pairing TX",      23 /*STROBE*/,  248,  96, 0x00FF40u, 200 },  // green-cyan — SET_GROUP send
+  // AP toggle cues: medium urgency, distinct from the pairing/headless family.
+  // ENABLED = violet (red+blue dominant), DISABLED = warm teal-amber — both
+  // mix ≥2 channels ≥0x33 per the project color rule and read clearly apart.
+  { IND_AP_ENABLED,       "AP Enabled",      23 /*STROBE*/,  245, 128, 0xCC33FFu, 230 },  // violet     — AP opened
+  { IND_AP_DISABLED,      "AP Disabled",     23 /*STROBE*/,  245, 128, 0xAA6633u, 230 },  // warm amber — AP closed
+  // ACTION_LOCKED: fast (alert tier) orange pulse confirming the press was
+  // seen but the local action is gated because a master is actively
+  // controlling the device. Distinct from the red-orange reject so the
+  // operator does not read it as a hard error.
+  { IND_ACTION_LOCKED,    "Action Locked",   23 /*STROBE*/,  250, 128, 0xFF6622u, 230 },  // orange     — gated by master
 };
 
 static const uint8_t INDICATOR_CATALOG_SIZE =
