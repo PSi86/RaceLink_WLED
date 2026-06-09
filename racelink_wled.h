@@ -1,10 +1,19 @@
 #pragma once
 
 #include "wled.h"
-// Transport backend selector: Ethernet (W5500/UDP) when built with
-// -D RACELINK_ETH, otherwise the LoRa/RadioLib backend. Both expose the same
-// RaceLinkTransport:: surface, so the rest of the usermod is medium-agnostic.
-#if defined(RACELINK_ETH)
+// RACELINK_ETH_EMAC (ESP32 internal EMAC, WiFiUDP) is an Ethernet build too:
+// pull in RACELINK_ETH so every medium-agnostic Ethernet code path below stays
+// active and only the transport include + radioInit() bring-up differ.
+#if defined(RACELINK_ETH_EMAC) && !defined(RACELINK_ETH)
+  #define RACELINK_ETH
+#endif
+// Transport backend selector: internal-EMAC (WiFiUDP) when built with
+// -D RACELINK_ETH_EMAC, W5500/UDP when built with -D RACELINK_ETH, otherwise the
+// LoRa/RadioLib backend. All three expose the same RaceLinkTransport:: surface,
+// so the rest of the usermod is medium-agnostic.
+#if defined(RACELINK_ETH_EMAC)
+  #include "racelink_transport_eth_emac.h"
+#elif defined(RACELINK_ETH)
   #include "racelink_transport_eth.h"
 #else
   #include "racelink_transport_core.h"
@@ -372,10 +381,12 @@ private:
   int8_t pinBusy = RACELINK_PIN_BUSY;
   int8_t pinRst  = RACELINK_PIN_RST;
 
-  #if defined(RACELINK_ETH)
+  #if defined(RACELINK_ETH) && !defined(RACELINK_ETH_EMAC)
   // W5500 SPI pins — runtime-configurable in the usermod settings, exactly like
   // the LoRa radio pins above. A change in the UI sets doReboot; the W5500 is
   // re-init'd at boot with the saved values (build-flag macros are the defaults).
+  // (Internal-EMAC builds have no configurable transport pins — the RMII/MDC/MDIO
+  // pins are owned by WLED's native Ethernet init.)
   int8_t ethSclk = RACELINK_ETH_SCLK;
   int8_t ethMosi = RACELINK_ETH_MOSI;
   int8_t ethMiso = RACELINK_ETH_MISO;

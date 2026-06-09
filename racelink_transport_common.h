@@ -71,6 +71,56 @@ inline bool receiverMatches(const uint8_t receiver3[3], const uint8_t myLast3[3]
   return isBroadcast3(receiver3) || same3(receiver3, myLast3);
 }
 
+// -------------------- Ethernet wire-framing helpers --------------------
+// Medium-agnostic translation between the firmware-internal Header7 frame and
+// the host's UDP datagram layout. Shared by both Ethernet backends (W5500 in
+// racelink_transport_eth.h and the internal-EMAC/WiFiUDP backend in
+// racelink_transport_eth_emac.h) so the framing lives in exactly one place.
+// Authoritative wire spec: memory `ethernet_block_e_wire_framing`.
+
+// Largest datagram we handle: Header7(7) + BODY_MAX(22) + 1 type byte, padded.
+static constexpr uint8_t ETH_MAX_DGRAM = 64;
+
+// Synthetic 3-byte "host/master" address stamped as Header7.sender on inbound
+// M2N datagrams (the host sends no sender3). Must not be broadcast (FF FF FF)
+// nor collide with a node's own last-3 MAC; the firmware only uses it for
+// master-tracking bookkeeping and echoes it back as the (host-ignored) N2M
+// receiver3. 'E','T','H'.
+static constexpr uint8_t ETH_HOST_SENDER3[3] = { 0x45, 0x54, 0x48 };
+
+// Build an N2M (node->host) datagram from a firmware-internal Header7 frame:
+//   datagram = [Header7.type] ++ (Header7 + body)
+// `frame`/`len` are exactly what RaceLinkProto::build() produced. Returns the
+// datagram length written to `outDg`, or 0 on bad input / capacity overflow.
+inline uint8_t buildN2M(const uint8_t* frame, uint8_t len, uint8_t* outDg, uint8_t outCap) {
+  if (!frame || len < (uint8_t)sizeof(RaceLinkProto::Header7)) return 0;
+  if ((uint16_t)len + 1u > outCap) return 0;
+  outDg[0] = frame[6];                         // Header7.type (bit7 set for N2M)
+  for (uint8_t i = 0; i < len; ++i) outDg[1 + i] = frame[i];
+  return (uint8_t)(len + 1);
+}
+
+// Reconstruct a firmware-internal Header7 frame from an inbound M2N datagram
+// [type_full][recv3][body]. Precondition: the caller has already verified
+// dgLen >= 4, the DIR bit is M2N (bit7 clear), and learned the host endpoint.
+// Fills `frame` = [ETH_HOST_SENDER3][recv3][type_full][body], sets `flen`, and
+// returns false only on capacity overflow.
+inline bool reconstructM2N(const uint8_t* dg, int dgLen, uint8_t* frame, uint8_t& flen) {
+  if (dgLen < 4) return false;
+  const uint8_t bodyLen = (uint8_t)(dgLen - 4);
+  if ((uint16_t)sizeof(RaceLinkProto::Header7) + bodyLen > ETH_MAX_DGRAM) return false;
+  frame[0] = ETH_HOST_SENDER3[0];
+  frame[1] = ETH_HOST_SENDER3[1];
+  frame[2] = ETH_HOST_SENDER3[2];
+  frame[3] = dg[1];                            // recv3
+  frame[4] = dg[2];
+  frame[5] = dg[3];
+  frame[6] = dg[0];                            // Header7.type (type_full)
+  for (uint8_t i = 0; i < bodyLen; ++i) frame[7 + i] = dg[4 + i];
+  flen = (uint8_t)(sizeof(RaceLinkProto::Header7) + bodyLen);
+  return true;
+}
+
 // -------------------- Stream helpers (RX reassembly) --------------------
 enum class StreamStatus : uint8_t { StreamStart, StreamContinue, StreamEnd, Error };
 

@@ -316,8 +316,13 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
     char eth[48];
     if (radioReady) {
       // Read the PHY link state on demand (only when the info panel renders).
+#if defined(RACELINK_ETH_EMAC)
+      const bool ethLinkUp = ETH.linkUp();   // internal EMAC, brought up by WLED
+#else
+      const bool ethLinkUp = rl.w5500.linkUp();
+#endif
       snprintf(eth, sizeof(eth), "%s  %u.%u.%u.%u (%s)",
-               rl.w5500.linkUp() ? "LINK UP" : "no link",
+               ethLinkUp ? "LINK UP" : "no link",
                rl.ip[0], rl.ip[1], rl.ip[2], rl.ip[3],
                rl.dhcpOk ? "DHCP" : "static");
     } else {
@@ -560,11 +565,12 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
   pins[F("DIO1")] = pinDio1;
   pins[F("BUSY")] = pinBusy;
   pins[F("RST")]  = pinRst;
-#else
+#elif !defined(RACELINK_ETH_EMAC)
   // Ethernet (W5500) builds: the SPI pins are runtime-configurable here, exactly
   // like the LoRa radio pins. Saved values load into eth* members in
   // readFromConfig() and apply when radioInit() runs at the next boot. (UDP
   // ports and DHCP/static IP mode remain compile-time RACELINK_ETH_* build flags.)
+  // Internal-EMAC builds expose no transport pins (RMII owned by WLED).
   JsonObject ethPins = top.createNestedObject("eth_pins");
   ethPins[F("SCLK")] = ethSclk;
   ethPins[F("MOSI")] = ethMosi;
@@ -768,9 +774,10 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
   }
 #endif // !RACELINK_ETH
 
-#if defined(RACELINK_ETH)
+#if defined(RACELINK_ETH) && !defined(RACELINK_ETH_EMAC)
   // W5500 SPI pins (runtime-configurable, parity with the LoRa radio pins). A
   // change requires a reboot to re-init SPI/Ethernet; suppressed on first boot.
+  // Internal-EMAC builds have no configurable transport pins (RMII owned by WLED).
   const int8_t oldEthSclk = ethSclk, oldEthMosi = ethMosi, oldEthMiso = ethMiso,
                oldEthCs = ethCs, oldEthRst = ethRst, oldEthInt = ethInt;
   {
@@ -892,7 +899,20 @@ void UsermodRaceLink::refreshFieldsFromSegment() {
 
 // ========= Radio =========
 bool UsermodRaceLink::radioInit() {
-#if defined(RACELINK_ETH)
+#if defined(RACELINK_ETH_EMAC)
+  // Internal-EMAC (ESP32 + RMII PHY) bring-up. The PHY/RMII/MDC/MDIO pins and
+  // DHCP are owned by WLED's native Ethernet (WLED_USE_ETHERNET +
+  // WLED_ETH_DEFAULT=WLED_ETH_GLEDOPTO), which PinManager-reserves them under
+  // PinOwner::Ethernet — so we must NOT allocate any transport pins here. We
+  // only open the UDP socket (deferred to service() once ETH has an IP).
+  RaceLinkTransport::EthCfg ethCfg;
+  ethCfg.nodePort = RACELINK_ETH_NODE_PORT;
+  radioInitCode = RaceLinkTransport::beginCommon(rl, ethCfg) ? 0 : -999;
+  if (radioInitCode != 0) return false;
+  rl.lbtEnable = false;                            // no LBT on a wired medium
+  RaceLinkTransport::setDefaultRxContinuous(rl);   // no-op on Ethernet
+  return true;
+#elif defined(RACELINK_ETH)
   // Ethernet (W5500/UDP) bring-up. SPI pins, RST and the UDP node port come
   // from the RACELINK_ETH_* build flags (defaults in racelink_transport_eth.h).
   //

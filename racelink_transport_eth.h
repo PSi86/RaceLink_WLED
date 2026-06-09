@@ -84,15 +84,9 @@
 
 namespace RaceLinkTransport {
 
-// Synthetic 3-byte "host/master" address stamped as Header7.sender on inbound
-// M2N datagrams (the host sends no sender3). Must not be broadcast (FF FF FF)
-// nor collide with a node's own last-3 MAC; the firmware only uses it for
-// master-tracking bookkeeping and echoes it back as the (host-ignored) N2M
-// receiver3. 'E','T','H'.
-static constexpr uint8_t ETH_HOST_SENDER3[3] = { 0x45, 0x54, 0x48 };
-
-// Largest datagram we handle: Header7(7) + BODY_MAX(22) + 1 type byte, padded.
-static constexpr uint8_t ETH_MAX_DGRAM = 64;
+// ETH_HOST_SENDER3 / ETH_MAX_DGRAM and the buildN2M()/reconstructM2N() wire-
+// framing helpers are medium-agnostic and now live in
+// racelink_transport_common.h (shared with the internal-EMAC backend).
 
 // -------------------- PHY config (stub for source-compat) --------------------
 // The LoRa backend's PhyCfg carries radio parameters; Ethernet has none. Kept
@@ -244,19 +238,17 @@ inline void setDefaultRxContinuous(Core& /*rl*/) {}
 // jitterMaxMs is ignored (no LBT/CAD on a wired medium).
 inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t /*jitterMaxMs*/ = 0) {
   if (!rl.netReady) return false;            // network not up yet (DHCP pending)
-  if (!buf || len < (uint8_t)sizeof(RaceLinkProto::Header7)) return false;
 
   // N2M datagram = [type_byte] ++ (Header7 + body), where type_byte = Header7.type.
   uint8_t dg[1 + ETH_MAX_DGRAM];
-  if ((uint16_t)len + 1u > sizeof(dg)) return false;
-  dg[0] = buf[6];                            // Header7.type (bit7 set for N2M)
-  for (uint8_t i = 0; i < len; ++i) dg[1 + i] = buf[i];
+  const uint8_t dgLen = buildN2M(buf, len, dg, sizeof(dg));
+  if (dgLen == 0) return false;
 
   static const uint8_t kBroadcast[4] = { 255, 255, 255, 255 };
   const uint8_t* dst   = rl.hostKnown ? rl.hostIp : kBroadcast;
   const uint16_t dport = rl.hostKnown ? rl.hostPort : (uint16_t)RACELINK_ETH_HOST_PORT;
 
-  const bool ok = rl.w5500.sendTo(dst, dport, dg, (uint16_t)(len + 1));
+  const bool ok = rl.w5500.sendTo(dst, dport, dg, dgLen);
   if (ok) { ++rl.txCount; rl.lastTxAtMs = millis(); }
   rl.txPending = false;  // never queued
   return ok;
@@ -320,20 +312,10 @@ inline void service(Core& rl, const Callbacks& cb) {
     rl.hostPort = rl.w5500.remotePort();
     rl.hostKnown = true;
 
-    const uint8_t bodyLen = (uint8_t)(n - 4);
-    if ((uint8_t)(sizeof(RaceLinkProto::Header7) + bodyLen) > ETH_MAX_DGRAM) continue;
-
     // Reconstruct the firmware-internal Header7 frame.
     uint8_t frame[ETH_MAX_DGRAM];
-    frame[0] = ETH_HOST_SENDER3[0];
-    frame[1] = ETH_HOST_SENDER3[1];
-    frame[2] = ETH_HOST_SENDER3[2];
-    frame[3] = dg[1];                          // recv3
-    frame[4] = dg[2];
-    frame[5] = dg[3];
-    frame[6] = typeFull;                       // Header7.type
-    for (uint8_t i = 0; i < bodyLen; ++i) frame[7 + i] = dg[4 + i];
-    const uint8_t flen = (uint8_t)(sizeof(RaceLinkProto::Header7) + bodyLen);
+    uint8_t flen = 0;
+    if (!reconstructM2N(dg, (int)n, frame, flen)) continue;
 
     ++rl.rxCountTotal;
 
