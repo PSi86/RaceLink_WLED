@@ -49,7 +49,11 @@ static uint32_t lastStreamAtMs = 0;
 
 static uint16_t debugCounter = 0;
 static constexpr uint32_t STARTUP_IDENTIFY_FIRST_DELAY_MS = 1000;
-static constexpr uint32_t STARTUP_IDENTIFY_SECOND_DELAY_MS = 10000;
+// Gap from the FIRST IDENTIFY_REPLY actually being sent to the second/retry
+// (not from boot): a fast single-loss retry instead of the old long wait.
+// The second attempt only fires if no master answered the first (current.
+// groupId still 0) and the button was not operated since boot.
+static constexpr uint32_t STARTUP_IDENTIFY_SECOND_DELAY_MS = 3000;
 
 static const char HEXLUT[] = "0123456789ABCDEF";
 
@@ -187,7 +191,9 @@ void UsermodRaceLink::setup() {
   const uint32_t nowMs = millis();
   startupIdentifyStage = 0;
   startupIdentifyAtMs[0] = nowMs + STARTUP_IDENTIFY_FIRST_DELAY_MS;
-  startupIdentifyAtMs[1] = nowMs + STARTUP_IDENTIFY_SECOND_DELAY_MS;
+  // [1] is anchored when the first reply is actually sent (first-send + delay),
+  // see serviceStartupIdentifyReplies(); this seed is never read on its own.
+  startupIdentifyAtMs[1] = nowMs + STARTUP_IDENTIFY_FIRST_DELAY_MS + STARTUP_IDENTIFY_SECOND_DELAY_MS;
   
   #ifdef RACELINK_EPAPER
     {
@@ -250,13 +256,14 @@ void UsermodRaceLink::setup() {
   }
 
   // Headless Mode auto-resume: if the device was last running as Headless
-  // Master before the power-cycle, run the IDENTIFY_REPLY probe to verify
-  // no real Gateway has taken over in the meantime. Two simultaneously
-  // powered-on persisted-headless devices resolve cleanly via the jitter
-  // inside tryStartHeadless() — the first one to finish its probe claims
-  // master and answers the other's probe with OPC_SET_GROUP, demoting it.
+  // Master before the power-cycle, do NOT promote immediately. Defer until the
+  // normal startup IDENTIFY_REPLY handshake has settled (loop()): the device
+  // announces itself like any unpaired node, and a real Gateway/master still
+  // present adopts it via OPC_SET_GROUP — it then stays a slave instead of
+  // wrongly re-promoting. Only if nobody claims it do we re-promote. This
+  // reuses the normal-start discovery path; no separate probe/jitter needed.
   if (overrides.headlessPersistedActive) {
-    tryStartHeadless();
+    headlessResumePending = true;
   }
 }
 
@@ -286,8 +293,16 @@ void UsermodRaceLink::loop() {
   // replaces the previous flag-/ISR-/onRx() handling
   RaceLinkTransport::service(rl, cb);
   serviceStartupIdentifyReplies();
-  // Headless Mode probe state machine + keepalive. Cheap when neither
-  // probing nor active (early-return on the first cycle).
+  // Deferred headless auto-resume: the startup IDENTIFY_REPLY sequence is done
+  // (stage 2 = both replies sent, or adopted, or button-skipped). If a master
+  // claimed us in the meantime (groupId != 0) we stay a slave; otherwise
+  // re-promote to Headless Master via the normal path (re-solicits + gate).
+  if (headlessResumePending && startupIdentifyStage >= 2) {
+    headlessResumePending = false;
+    if (current.groupId == 0) tryStartHeadless();
+  }
+  // Headless Mode SYNC keepalive. Cheap when inactive (early-return on the
+  // first cycle).
   serviceHeadless(nowMs);
   // Offset-mode: fire any deferred apply whose deadline has elapsed.
   // Cheap when nothing is queued (single bool check).
@@ -1342,15 +1357,11 @@ bool UsermodRaceLink::masterContactedRecently() const {
 void UsermodRaceLink::noteMasterRx() {
   lastMasterRxMs = millis();
   anyMasterRxSinceBoot = true;
-  // Headless promotion safety: ANY accepted master-side packet (or pairing
-  // event) during our probe window proves a master is alive on this channel.
-  // Refuse the promotion — the operator gets a red blink from
-  // serviceHeadless() on its next tick. Covers both the explicit
-  // OPC_SET_GROUP response and incidental traffic from a Gateway already
-  // running other slaves.
-  if (headless.probing) {
-    headless.probeAborted = true;
-  }
+  // This feeds masterContactedRecently(), which now gates BOTH the standalone
+  // button actions and the headless 5-click promotion: a recently-heard
+  // learned master makes the promotion refuse (red blink) instead of
+  // promoting. A foreign Gateway claiming an active headless master is
+  // handled separately by the master-alive detector in handlePacket().
 }
 
 // ========= Custom button (GPIO 0) =========
@@ -1382,6 +1393,10 @@ void UsermodRaceLink::handleRaceLinkButton(uint8_t /*b*/, bool pressed, uint32_t
     btn.down = true;
     btn.pressedAtMs = now;
     btn.longHandled = false;
+    // Operating the button means "I do not want gateway+master mode"
+    // (standalone or headless master instead) — suppress the second
+    // automatic startup IDENTIFY_REPLY. See serviceStartupIdentifyReplies().
+    startupBtnUsed = true;
     return;
   }
 
@@ -1392,6 +1407,14 @@ void UsermodRaceLink::handleRaceLinkButton(uint8_t /*b*/, bool pressed, uint32_t
       btn.briDirUp    = !btn.briDirUp;       // toggle direction on every hold
       btn.lastFadeTickMs = now;
       btn.pendingShortClicks = 0;             // hold is explicitly not a multi-tap
+      // Feedback if the fade is gated: a master is actively controlling, so
+      // serviceButtonFade() will no-op the whole hold. Fire the "locked" cue
+      // once here (longHandled guards re-entry) so the operator sees the
+      // press was registered but is blocked, instead of silence. Headless
+      // master clears masterKnown, so the gate is false there — no false cue.
+      if (masterContactedRecently()) {
+        applyLocalIndicator(RaceLinkIndicators::IND_ACTION_LOCKED, 1);
+      }
     }
     return;
   }
@@ -1456,8 +1479,10 @@ void UsermodRaceLink::handleRaceLinkButton(uint8_t /*b*/, bool pressed, uint32_t
         return;
       }
       if (clicks == 3) {
-        // Hotspot recovery — ALWAYS, independent of the master-quiet-gate.
-        WLED::instance().initAP(true);
+        // Hotspot toggle — ALWAYS available, independent of the
+        // master-quiet-gate. Opens the AP if currently closed, closes it if
+        // open; both transitions emit a distinct strobe cue (setApMode).
+        setApMode(!apActive);
         return;
       }
       // clicks == 2 -> intentionally no action (reserved for future use).
@@ -1470,6 +1495,11 @@ void UsermodRaceLink::handleRaceLinkButton(uint8_t /*b*/, bool pressed, uint32_t
           // Cycle color through R -> G -> B -> random cycle. Idle reset (>10s
           // since last click) falls back to R.
           applyColorCycleStep(now);
+        } else {
+          // Gated: a master is actively controlling, so the local color cycle
+          // is suppressed. Confirm the press with the "locked" cue rather than
+          // ignoring it silently.
+          applyLocalIndicator(RaceLinkIndicators::IND_ACTION_LOCKED, 1);
         }
       }
     }
@@ -1519,6 +1549,24 @@ void UsermodRaceLink::serviceButtonFade(uint32_t now) {
   // the hold. Sending per-tick would flood the single-slot TX queue
   // (~30 ms tick vs LBT backoff + ToA). The final value is broadcast once
   // on button release; see handleRaceLinkButton's falling-edge block.
+}
+
+void UsermodRaceLink::setApMode(bool enable) {
+  // Centralises AP open/close + visual feedback so the 3-click toggle and the
+  // remote OPC_CONFIG 0x04 option behave identically. The close path mirrors
+  // WLED's own AP teardown (dnsServer + softAPdisconnect) and clears the
+  // apActive global so the next toggle / STATUS reply reflects reality.
+  if (enable) {
+    WLED::instance().initAP(true);
+    applyLocalIndicator(RaceLinkIndicators::IND_AP_ENABLED, 3);
+    DEBUG_PRINTLN(F("[RaceLink] AP mode: ENABLED"));
+  } else {
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    apActive = false;
+    applyLocalIndicator(RaceLinkIndicators::IND_AP_DISABLED, 3);
+    DEBUG_PRINTLN(F("[RaceLink] AP mode: DISABLED"));
+  }
 }
 
 bool UsermodRaceLink::handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]) {
@@ -1631,20 +1679,15 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
   // MAC-filter state — e.g. a Gateway's periodic OPC_SYNC autosync that
   // would otherwise be dropped because masterKnown is false after a
   // power-cycle. The user-stated principle is "a real Gateway always wins
-  // over headless mode", so:
-  //   probing -> mark probeAborted; serviceHeadless red-blinks and refuses
-  //              promotion on its next tick.
-  //   active  -> step down immediately. Re-arming headless is a deliberate
-  //              5-click away once the gateway is gone.
-  // We never react to our own broadcasts (we don't receive them on the
-  // radio anyway, but the same3-against-self check is defensive). Normal
-  // dispatch continues below so e.g. an OPC_SET_GROUP can still finish the
-  // re-pair on the same packet.
+  // over headless mode": if we're an active headless master, step down
+  // immediately. Re-arming headless is a deliberate 5-click away once the
+  // gateway is gone. We never react to our own broadcasts (we don't receive
+  // them on the radio anyway, but the same3-against-self check is defensive).
+  // Normal dispatch continues below so e.g. an OPC_SET_GROUP can still finish
+  // the re-pair on the same packet.
   if (type_dir(h.type) == DIR_M2N
       && !RaceLinkTransport::same3(h.sender, rl.myLast3)) {
-    if (headless.probing) {
-      headless.probeAborted = true;
-    } else if (headless.active) {
+    if (headless.active) {
       exitHeadlessMode();
     }
   }
@@ -1716,7 +1759,6 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       // like any other slave. ``exitHeadlessMode`` clears the persisted-
       // active flag so we will not re-promote at the next reboot — the
       // operator can re-enable headless via 5-click whenever desired.
-      // (probeAborted for the probing case is set in noteMasterRx().)
       if (headless.active) {
         exitHeadlessMode();
       }
@@ -1726,11 +1768,13 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
 
       learnMasterFromSender(h.sender, /*persistIfEnabled*/true);
 
-      // Visual feedback via the central indicator system: 3-second white
-      // breathe overlay, then auto-restore to whatever was on the strip
-      // before (boot-random for fresh slaves, last scene for re-pair).
-      // Replaces the previous persistent showPairConfirmedEffect() call.
-      applyLocalIndicator(RaceLinkIndicators::IND_PAIR_CONFIRMED, 5);
+      // Visual feedback via the central indicator system: a short teal
+      // strobe (frame-buffer overlay). The Headless master rebroadcasts its
+      // current scene ~1 s after binding; applyLocalScene() writes that scene
+      // to the segment UNDERNEATH this overlay without cancelling it, so the
+      // confirmation strobe runs in full and the master scene is revealed the
+      // instant it expires. ~2 s keeps the join snappy.
+      applyLocalIndicator(RaceLinkIndicators::IND_PAIR_CONFIRMED, 2);
 
       sendAckTo(h.sender, OPC_SET_GROUP, ACK_OK);
       acted = true;
@@ -1834,13 +1878,8 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
           // the new macFilterPersist value at next boot.
           configNeedsWrite = true;
         }
-      } else if (p.option == 0x04) { // Enable AP Mode
-        if (p.data0 != 0) WLED::instance().initAP(true);
-        else {
-          dnsServer.stop();
-          WiFi.softAPdisconnect(true);
-          apActive = false;
-        }
+      } else if (p.option == 0x04) { // Enable/Disable AP Mode
+        setApMode(p.data0 != 0);
       } else if (p.option == 0x05) { // Set FPS override
         overrides.fps = p.data0;
         strip.setTargetFps(overrides.fps);
@@ -2186,7 +2225,15 @@ void UsermodRaceLink::serviceStartupIdentifyReplies() {
   if (!radioReady) return;
   if (startupIdentifyStage >= 2) return;
   if (current.groupId != 0) {
+    // A master answered the first reply (assigned a group) — done.
     startupIdentifyStage = 2;
+    return;
+  }
+  // Button operated since boot → the user does not want gateway+master mode;
+  // skip the second automatic attempt (the first, at +1 s, may already be out).
+  if (startupIdentifyStage == 1 && startupBtnUsed) {
+    startupIdentifyStage = 2;
+    DEBUG_PRINTLN(F("[RaceLink] Startup IDENTIFY_REPLY: 2nd skipped (button used)"));
     return;
   }
 
@@ -2197,7 +2244,11 @@ void UsermodRaceLink::serviceStartupIdentifyReplies() {
   if (!sendIdentifyReplyTo(BROADCAST_LAST3, true)) return;
 
   startupIdentifyStage++;
-  if (startupIdentifyStage >= 2) {
+  if (startupIdentifyStage == 1) {
+    // Anchor the retry 3 s after the first reply actually went out (not from
+    // boot), so a single lost first reply recovers quickly.
+    startupIdentifyAtMs[1] = nowMs + STARTUP_IDENTIFY_SECOND_DELAY_MS;
+  } else if (startupIdentifyStage >= 2) {
     DEBUG_PRINTLN(F("[RaceLink] Startup IDENTIFY_REPLY sequence complete"));
   }
 }
@@ -2891,104 +2942,48 @@ void UsermodRaceLink::tryStartHeadless() {
     exitHeadlessMode();
     return;
   }
-  // Already in the probe window — silently ignore (a stuck 5-click is
-  // probably the user being impatient, not a request to re-probe).
-  if (headless.probing) return;
   if (!radioReady || !rl.macReadOK) {
-    DEBUG_PRINTLN(F("[RaceLink] Headless: radio/MAC not ready, refusing probe"));
+    DEBUG_PRINTLN(F("[RaceLink] Headless: radio/MAC not ready, refusing promotion"));
     return;
   }
 
-  // Pick the jittered first-send time. esp_random() is the hardware RNG
-  // so two simultaneously powered-on persisted-headless devices end up
-  // with distinct probe schedules.
-  const uint32_t now = millis();
-  const uint32_t range = RaceLinkHeadless::HEADLESS_PROBE_JITTER_MAX_MS
-                       - RaceLinkHeadless::HEADLESS_PROBE_JITTER_MIN_MS;
-  const uint32_t j = RaceLinkHeadless::HEADLESS_PROBE_JITTER_MIN_MS
-                   + (esp_random() % (range + 1));
-  headless.probing            = true;
-  headless.probeAborted       = false;
-  headless.probeFirstSent     = false;
-  headless.probeSecondSent    = false;
-  headless.probeFirstSendAtMs = now + j;
-  headless.probeSecondSendAtMs= now + j + RaceLinkHeadless::HEADLESS_PROBE_RETRY_OFFSET_MS;
-  headless.probeStartedAtMs   = 0; // set when the first probe actually goes out
-  DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: probe scheduled (+%lu ms)\n"),
-                 (unsigned long)j);
+  // Unified gating with standalone local control: promotion uses the SAME
+  // master-quiet gate as the button color/brightness actions. If a learned
+  // master has spoken within the quiet window, refuse and flash red.
+  if (masterContactedRecently()) {
+    applyLocalIndicator(RaceLinkIndicators::IND_PROBE_REJECTED, 3);
+    DEBUG_PRINTLN(F("[RaceLink] Headless: refused — master active"));
+    return;
+  }
+  // Announce ourselves with the SAME IDENTIFY_REPLY the normal startup uses
+  // (carries our current groupId — 0 when unpaired, the solicitation a master
+  // adopts). Sent BEFORE promoting so an active Gateway / Headless master that
+  // is present (but not a *learned* master, so the gate above passed) answers
+  // with OPC_SET_GROUP: that handler calls exitHeadlessMode() and we become
+  // its slave, self-aborting this promotion. No probe window / jitter — we
+  // promote immediately for instant feedback and let SET_GROUP revert us if a
+  // master claims us a moment later.
+  static constexpr uint8_t BROADCAST_LAST3[3] = {0xFF, 0xFF, 0xFF};
+  sendIdentifyReplyTo(BROADCAST_LAST3, true);
+  enterHeadlessMode();
 }
 
 void UsermodRaceLink::serviceHeadless(uint32_t now) {
-  if (!headless.probing && !headless.active) return;
+  if (!headless.active) return;
 
-  if (headless.probing) {
-    // Abort path: noteMasterRx() set probeAborted because some master
-    // proved it is alive on the channel during our probe window.
-    if (headless.probeAborted) {
-      headless.probing = false;
-      headless.probeAborted = false;
-      // Indicator system drives the 3-second red-strobe overlay AND auto-
-      // restores the pre-probe segment state (typically the boot-random
-      // color) when the duration expires. Replaces the old btn.blink*
-      // state machine + manual applyCycleColor red/black toggle.
-      applyLocalIndicator(RaceLinkIndicators::IND_PROBE_REJECTED, 5);
-      DEBUG_PRINTLN(F("[RaceLink] Headless: probe rejected — master active"));
-      return;
-    }
-
-    // First scheduled probe send (start-of-window anchor).
-    if (!headless.probeFirstSent && (int32_t)(now - headless.probeFirstSendAtMs) >= 0) {
-      if (radioReady && rl.macReadOK) {
-        uint8_t out[32];
-        uint8_t n = RaceLinkHeadless::buildIdentifyProbe(
-            out, rl.myLast3, rl.myMac6, RaceLinkProto::PROTO_VER_MAJOR, DEV_TYPE);
-        // armBlip=false: probe runs while headless.active is still false anyway,
-        // and a TX flash during the "am I the master?" handshake would mislead
-        // the operator into thinking promotion already happened.
-        if (n) headlessSendTx(out, n, /*armBlip=*/false);
-      }
-      headless.probeFirstSent   = true;
-      headless.probeStartedAtMs = now;
-    }
-
-    // Second probe — single-loss coverage at SF7.
-    if (headless.probeFirstSent && !headless.probeSecondSent
-        && (int32_t)(now - headless.probeSecondSendAtMs) >= 0) {
-      if (radioReady && rl.macReadOK) {
-        uint8_t out[32];
-        uint8_t n = RaceLinkHeadless::buildIdentifyProbe(
-            out, rl.myLast3, rl.myMac6, RaceLinkProto::PROTO_VER_MAJOR, DEV_TYPE);
-        if (n) headlessSendTx(out, n, /*armBlip=*/false);
-      }
-      headless.probeSecondSent = true;
-    }
-
-    // Timeout: no abort fired within the probe window → promote.
-    if (headless.probeFirstSent
-        && (now - headless.probeStartedAtMs) >= RaceLinkHeadless::HEADLESS_PROBE_TIMEOUT_MS) {
-      enterHeadlessMode();
-    }
-    return;
-  }
-
-  // active: SYNC keepalive. 4B autosync (timebase + bri) every
+  // SYNC keepalive. 4B autosync (timebase + bri) every
   // HEADLESS_SYNC_KEEPALIVE_MS so paired slaves' masterContactedRecently()
   // stays true AND their strip.timebase stays anchored to the master
   // clock — cyclic effects like Breathe then hold phase across the fleet.
-  // Scene state is NOT re-broadcast: a slave that joins mid-session is
-  // pair-confirmed via showPairConfirmedEffect and stays on its boot
-  // visual until the operator drives a new scene (1-click) — exactly the
-  // same UX a Gateway+Host pair produces.
-  if (headless.active) {
-    if ((now - headless.lastBroadcastAtMs) >= RaceLinkHeadless::HEADLESS_SYNC_KEEPALIVE_MS) {
-      headlessBroadcastSync(now);
-    }
+  // The current scene is pushed once when a slave binds (headlessAssignGroupTo
+  // → scheduleSceneRebroadcast); the keepalive itself only carries SYNC.
+  if ((now - headless.lastBroadcastAtMs) >= RaceLinkHeadless::HEADLESS_SYNC_KEEPALIVE_MS) {
+    headlessBroadcastSync(now);
   }
 }
 
 void UsermodRaceLink::enterHeadlessMode() {
   headless.active  = true;
-  headless.probing = false;
   // Promoting to headless master is a deliberate role transition; any
   // running indicator overlay should yield to the entry cue (solid blue)
   // and the subsequent scene broadcast.
@@ -3016,11 +3011,12 @@ void UsermodRaceLink::enterHeadlessMode() {
   memset(masterFull6, 0, sizeof(masterFull6));
   anyMasterRxSinceBoot = false;
   lastMasterRxMs       = 0;
-  // Visual success cue: 3-second blue breathe via the central indicator
-  // system. If a persisted scene is restored right after (see below),
-  // headlessBroadcastCurrentScene -> applyLocalScene -> cancelIndicator
-  // preempts this overlay immediately and the operator sees the scene
-  // instead — matching the previous solid-blue behavior.
+  // Visual success cue: 5-second ice-cyan strobe via the central indicator
+  // system (frame-buffer overlay). If a persisted scene is restored right
+  // after (see below), headlessBroadcastCurrentScene broadcasts it to the
+  // slaves immediately and applyLocalScene() writes it to our own segment
+  // UNDERNEATH this overlay (no cancel) — so the entry cue plays in full and
+  // the master's scene is revealed the instant the strobe expires.
   applyLocalIndicator(RaceLinkIndicators::IND_HEADLESS_ENTER, 5);
   DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: ACTIVE (counter=%u, scene=%u)\n"),
                  (unsigned)overrides.headlessGroupCounter,
@@ -3069,7 +3065,6 @@ void UsermodRaceLink::enterHeadlessMode() {
 void UsermodRaceLink::exitHeadlessMode() {
   if (!headless.active && !overrides.headlessPersistedActive) return;
   headless.active  = false;
-  headless.probing = false;
   // Role transition out of headless — clear any indicator overlay so the
   // boot-color exit cue below is what the operator sees.
   cancelIndicator();
@@ -3374,11 +3369,15 @@ void UsermodRaceLink::applyLocalScene(uint8_t sceneId, uint8_t brightness) {
     // Unknown scene-id from a future catalog version — silently drop.
     return;
   }
-  // A new scene preempts any running indicator overlay: the scene visual
-  // is the new authoritative state, so an end-of-indicator restore would
-  // just overwrite it. cancelIndicator drops the active flag without
-  // touching the segment — the writes below set the final state.
-  cancelIndicator();
+  // NOTE: intentionally NO cancelIndicator() here. The indicator is a
+  // frame-buffer overlay (handleOverlayDraw) fully decoupled from the segment
+  // effect, and serviceIndicator() merely drops the active flag on expiry — it
+  // never restores segment state. So writing the new scene underneath a
+  // running overlay (e.g. the pair-confirmation teal on a freshly-bound slave,
+  // or the cyan entry strobe on the new master) is invisible while the strobe
+  // runs and is revealed the instant the overlay expires. Cancelling here was
+  // a leftover from the old setMode/restore indicator model and would cut the
+  // confirmation cue short for no reason.
 
   // Per-group phase offset for staggered fleet effects (e.g. Offset Breathe).
   // Computed locally from the catalog row × this device's groupId so the

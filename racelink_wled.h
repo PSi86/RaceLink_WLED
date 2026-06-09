@@ -662,6 +662,17 @@ private:
   uint8_t targetForReplyLast3[3] = {0};
   uint8_t startupIdentifyStage = 0;
   uint32_t startupIdentifyAtMs[2] = {0, 0};
+  // Set on the first button rising-edge since boot. Operating the button
+  // signals "I do not want gateway+master mode" (standalone or headless
+  // master instead), so the second automatic startup IDENTIFY_REPLY is
+  // skipped — see serviceStartupIdentifyReplies().
+  bool startupBtnUsed = false;
+
+  // Persisted-headless auto-resume is deferred until the normal startup
+  // IDENTIFY_REPLY handshake has settled: if a real master/Gateway is still
+  // around it adopts us via SET_GROUP (we stay a slave); only if nobody
+  // claims us do we re-promote to Headless Master. See loop().
+  bool headlessResumePending = false;
 
   #if defined(RACELINK_STARTBLOCK)
     uint8_t numberOfSlots = 1;
@@ -723,6 +734,10 @@ private:
   void handleRaceLinkButton(uint8_t b, bool pressed, uint32_t now);
   void serviceButtonFade(uint32_t now);
 
+  // WiFi AP (hotspot) open/close with a strobe cue on each transition.
+  // Shared by the 3-click toggle and the remote OPC_CONFIG 0x04 option.
+  void setApMode(bool enable);
+
   // ===== Headless Mode =====
   // Five-click on the button (or boot-time auto-resume when persisted)
   // promotes a device to Headless Master: it assigns groups to incoming
@@ -733,17 +748,17 @@ private:
   // for the full rationale; the scene catalog + packet builders live in
   // racelink_headless.h so external software (FPVGate) can reuse them.
 
-  // Start the IDENTIFY_REPLY probe sequence. Schedules two broadcasts
-  // inside HEADLESS_PROBE_TIMEOUT_MS with random jitter; serviceHeadless()
-  // promotes the device if no OPC_SET_GROUP arrives during the window.
-  // If already-active, toggles back to a normal node.
+  // 5-click toggle. If already active, steps down to a normal node.
+  // Otherwise promotes IMMEDIATELY unless masterContactedRecently() is true
+  // (a learned master spoke within the quiet window) — same gate as the
+  // standalone button actions. No probe window: the runtime master-alive
+  // detector in handlePacket() auto-demotes if a real Gateway appears later.
   void tryStartHeadless();
-  // Loop-tick: emits scheduled probe broadcasts, evaluates the timeout,
-  // and runs the keepalive (re-broadcast current scene every
-  // HEADLESS_SCENE_KEEPALIVE_MS while active).
+  // Loop-tick: runs the SYNC keepalive while active (re-anchors slave
+  // timebases every HEADLESS_SYNC_KEEPALIVE_MS). No-op when inactive.
   void serviceHeadless(uint32_t now);
-  // Probe succeeded -> enter active mode: persist state, broadcast last
-  // scene once, pulse blue 3× as visual feedback.
+  // Enter active mode: persist state, broadcast last scene once, blue
+  // strobe as visual feedback.
   void enterHeadlessMode();
   // Leave active mode (5-click toggle or Gateway-takeover OPC_SET_GROUP).
   // Clears persisted-active flag and stops keepalive emissions.
