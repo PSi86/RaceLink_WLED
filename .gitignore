@@ -14,3 +14,10 @@ __pycache__/
 .claude/
 CLAUDE.md
 CLAUDE.local.md
+
+# Staged release artifacts and the scaffolding around them
+# (scripts/build_and_stage_profiles.sh).
+dist/
+built_envs.txt
+metadata.json
+external/

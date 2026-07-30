@@ -7,6 +7,16 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.release_staging import stage_environment
+
+# The profiles a release actually builds and publishes.
+#
+# RaceLink_Node_v7_classic_esp32_emac is committed but deliberately absent:
+# its internal-EMAC Ethernet support is still in bring-up and has never been
+# released. The omission is intentional, not an oversight — add it here once
+# Ethernet ships, and note that it is the first classic ESP32 in the set, so
+# its bootloader sits at 0x1000 rather than 0x0 (release_staging.py cross-
+# checks that and will refuse to stage it if the offsets disagree).
 SHIPPING_PROFILE_FILENAMES = (
     "RaceLink_Node_v1_c3_ct62.platformio_override.ini",
     "RaceLink_Node_v3_s2_llcc68.platformio_override.ini",
@@ -140,32 +150,48 @@ def sanitize_ref_for_filename(raw_ref: str) -> str:
     return value or "unknown-ref"
 
 
+def wled_variant(wled_ref: str) -> str:
+    """Filename fragment naming the upstream release a build wraps.
+
+    One dash-free field, so an asset states both its own RaceLink version and
+    the WLED version it was built against without making the name ambiguous.
+    """
+    return f"wled_{sanitize_ref_for_filename(wled_ref)}"
+
+
 def stage_release_assets(
     *,
     profile_path: Path,
-    release_dir: Path,
+    build_root: Path,
     dist_dir: Path,
     release_version: str,
     wled_ref: str,
-) -> list[Path]:
-    """Rename WLED output artifacts to stable RaceLink release filenames."""
+    metadata: dict,
+    product: str = "RaceLink_WLED",
+) -> list[dict]:
+    """Stage every asset for one profile's environments.
+
+    Returns a manifest entry per environment; the caller accumulates them
+    across profiles and writes the release index once.
+
+    Note the source: PlatformIO's build directory, not WLED's
+    ``build_output/release``. Both hold the same application image, but the
+    build directory also holds the bootloader and the partition table that the
+    factory image needs, and it is what the flash-image offsets in PlatformIO's
+    metadata point at.
+    """
     dist_dir.mkdir(parents=True, exist_ok=True)
-    staged_paths: list[Path] = []
-    ref_fragment = sanitize_ref_for_filename(wled_ref)
+    variant = wled_variant(wled_ref)
 
-    for env in parse_profile_environments(profile_path):
-        candidates = sorted(release_dir.glob(f"WLED_*_{env.release_name}.bin*"))
-        if not candidates:
-            raise FileNotFoundError(
-                f"Could not find build_output/release artifact for {env.release_name}"
-            )
-
-        for candidate in candidates:
-            suffix = "".join(candidate.suffixes)
-            target = dist_dir / (
-                f"RaceLink_WLED-{release_version}-{env.name}-{ref_fragment}{suffix}"
-            )
-            shutil.copy2(candidate, target)
-            staged_paths.append(target)
-
-    return staged_paths
+    return [
+        stage_environment(
+            env=env.name,
+            product=product,
+            version=release_version,
+            build_dir=build_root / env.name,
+            dist_dir=dist_dir,
+            metadata=metadata,
+            variant=variant,
+        )
+        for env in parse_profile_environments(profile_path)
+    ]

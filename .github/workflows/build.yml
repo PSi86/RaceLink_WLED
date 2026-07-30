@@ -1,0 +1,181 @@
+name: Build Firmware
+
+# Compile-only counterpart to release.yml. That workflow is the only thing that
+# ever built this repo, and it tags and publishes in the same run — so a broken
+# build or a broken staging step surfaced in the middle of a real release.
+#
+# This job runs the identical build-and-stage script against the latest
+# published WLED release, verifies the resulting factory images, and ships
+# nothing.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      wled_ref:
+        description: "Optional WLED tag/ref override. Leave empty to use the latest published WLED release."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - name: Check out RaceLink_WLED repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Run static tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Resolve WLED source ref
+        id: wled_source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ref="$(python scripts/resolve_wled_release.py --wled-ref "${{ inputs.wled_ref }}" --print ref)"
+          repository="$(python scripts/resolve_wled_release.py --wled-ref "${{ inputs.wled_ref }}" --print repository)"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out WLED repository
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: ${{ steps.wled_source.outputs.repository }}
+          ref: ${{ steps.wled_source.outputs.ref }}
+          path: external/WLED
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: external/WLED/package-lock.json
+
+      - name: Cache PlatformIO installation
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('external/WLED/platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install build prerequisites
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r external/WLED/requirements.txt
+          # Same pin as release.yml — this job rehearses the staging step.
+          python -m pip install "esptool>=5,<6"
+          npm --prefix external/WLED ci
+
+      # The same script release.yml runs, so release day differs only in the
+      # version string.
+      - name: Build and stage every shipping profile
+        shell: bash
+        run: |
+          bash scripts/build_and_stage_profiles.sh \
+            "$GITHUB_WORKSPACE" \
+            "$GITHUB_WORKSPACE/external/WLED" \
+            "0.0.0-ci" \
+            "${{ steps.wled_source.outputs.ref }}" \
+            "$GITHUB_WORKSPACE/dist"
+
+      - name: Verify the staged factory images
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(
+              next(Path("dist").glob("*-assets.json")).read_text(encoding="utf-8")
+          )
+          for environment in manifest["environments"]:
+              assets = {asset["kind"]: asset for asset in environment["assets"]}
+              image = (Path("dist") / assets["factory"]["file"]).read_bytes()
+              app_offset = environment["app_offset"]
+
+              expectations = [
+                  (assets["bootloader"]["offset"], b"\xe9", "bootloader"),
+                  (assets["partitions"]["offset"], b"\xaa\x50", "partition table"),
+                  (app_offset, b"\xe9", "application"),
+              ]
+              for offset, magic, label in expectations:
+                  found = image[offset : offset + len(magic)]
+                  if found != magic:
+                      raise SystemExit(
+                          f"{environment['env']}: no {label} at 0x{offset:x} "
+                          f"(found {found.hex()}, expected {magic.hex()})"
+                      )
+
+              published = (Path("dist") / assets["app"]["file"]).read_bytes()
+              if image[app_offset : app_offset + len(published)] != published:
+                  raise SystemExit(
+                      f"{environment['env']}: the application embedded in the factory "
+                      "image differs from the published application image"
+                  )
+              print(
+                  f"{environment['env']}: {environment['chip']}, DEV_TYPE "
+                  f"{environment['dev_type']}, factory image verified ({len(image)} bytes)"
+              )
+          PY
+
+      - name: Write build summary
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(
+              next(Path("dist").glob("*-assets.json")).read_text(encoding="utf-8")
+          )
+          lines = [
+              "## Build Summary",
+              "",
+              f"WLED ref: `{manifest.get('wled_ref')}`",
+              "",
+              "| Environment | Chip | DEV_TYPE | Application | Factory image |",
+              "|---|---|---|---|---|",
+          ]
+          for environment in manifest["environments"]:
+              assets = {asset["kind"]: asset for asset in environment["assets"]}
+              lines.append(
+                  f"| `{environment['env']}` | {environment['chip']} | "
+                  f"{environment['dev_type']} | {assets['app']['size'] / 1024:.1f} KiB | "
+                  f"{assets['factory']['size'] / 1024:.1f} KiB |"
+              )
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(
+              "\n".join(lines) + "\n", encoding="utf-8"
+          )
+          PY
+
+      # The rehearsed release assets, so a pull request can be flashed on
+      # hardware — including the factory images — without cutting a release.
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: racelink_wled_build
+          if-no-files-found: error
+          path: dist/*

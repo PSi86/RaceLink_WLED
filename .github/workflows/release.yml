@@ -120,6 +120,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r external/WLED/requirements.txt
+          # esptool 5 renamed merge_bin to merge-bin; pin the major so the
+          # rename cannot break a release, and so the defaults the staging
+          # code relies on (flash mode/freq/size = keep) stay put.
+          python -m pip install "esptool>=5,<6"
           npm --prefix external/WLED ci
 
       - name: Build shipping RaceLink firmware profiles
@@ -129,87 +133,18 @@ jobs:
           RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
           WLED_REF: ${{ steps.wled_source.outputs.ref }}
         run: |
-          set -euo pipefail
-          mkdir -p dist
-          : > dist/built_envs.txt
-          # Single source of truth: SHIPPING_PROFILE_FILENAMES in
-          # scripts/release_profiles.py (via iter_shipping_profiles, which also
-          # validates each file exists). Keep this in sync by editing that tuple
-          # only -- do NOT hard-code the profile list here.
-          mapfile -t profiles < <(
-            python -c "from pathlib import Path; from scripts.release_profiles import iter_shipping_profiles; [print('build_profiles/' + p.name) for p in iter_shipping_profiles(Path('build_profiles'))]"
-          )
-          if [ "${#profiles[@]}" -eq 0 ]; then
-            echo "No shipping profiles resolved from SHIPPING_PROFILE_FILENAMES"
-            exit 1
-          fi
-          printf 'Shipping profiles to build:\n'; printf '  %s\n' "${profiles[@]}"
-
-          for profile in "${profiles[@]}"; do
-            rm -rf external/WLED/build_output/release
-            mkdir -p external/WLED/build_output/release
-
-            mapfile -t envs < <(
-              python scripts/stage_wled_profile.py stage-profile \
-                --repo-root "$GITHUB_WORKSPACE" \
-                --wled-dir "$GITHUB_WORKSPACE/external/WLED" \
-                --profile "$GITHUB_WORKSPACE/$profile"
-            )
-
-            if [ "${#envs[@]}" -eq 0 ]; then
-              echo "Profile $profile did not expose any envs"
-              exit 1
-            fi
-
-            for env_name in "${envs[@]}"; do
-              echo "$env_name" >> dist/built_envs.txt
-            done
-
-            args=()
-            for env_name in "${envs[@]}"; do
-              args+=("-e" "$env_name")
-            done
-
-            python -m platformio run \
-              --project-dir "$GITHUB_WORKSPACE/external/WLED" \
-              "${args[@]}"
-
-            python scripts/stage_wled_profile.py stage-assets \
-              --profile "$GITHUB_WORKSPACE/$profile" \
-              --release-dir "$GITHUB_WORKSPACE/external/WLED/build_output/release" \
-              --dist-dir "$GITHUB_WORKSPACE/dist" \
-              --release-version "$RELEASE_VERSION" \
-              --wled-ref "$WLED_REF"
-          done
+          bash scripts/build_and_stage_profiles.sh \
+            "$GITHUB_WORKSPACE" \
+            "$GITHUB_WORKSPACE/external/WLED" \
+            "$RELEASE_VERSION" \
+            "$WLED_REF" \
+            "$GITHUB_WORKSPACE/dist"
 
           {
             echo "built_envs<<EOF"
-            sort -u dist/built_envs.txt
+            sort -u built_envs.txt
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Generate SHA256 manifest
-        run: |
-          python - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-
-          dist = Path("dist")
-          lines = []
-          for path in sorted(dist.glob("RaceLink_WLED-*")):
-              if not path.is_file():
-                  continue
-              digest = hashlib.sha256(path.read_bytes()).hexdigest()
-              lines.append(f"{digest}  {path.name}")
-          if not lines:
-              raise SystemExit("No staged release artifacts found in dist/")
-          version = json.loads(Path("version.json").read_text(encoding="utf-8"))["version"]
-          (dist / f"RaceLink_WLED-{version}-sha256.txt").write_text(
-              "\n".join(lines) + "\n",
-              encoding="utf-8",
-          )
-          PY
 
       - name: Commit release metadata
         run: |
@@ -229,6 +164,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: racelink_wled_release
+          if-no-files-found: error
           path: dist/*
 
       - name: Publish GitHub release
@@ -237,6 +173,29 @@ jobs:
           tag_name: ${{ steps.release_version.outputs.tag }}
           target_commitish: ${{ inputs.target_branch }}
           generate_release_notes: true
+          body: |
+            Built against WLED `${{ steps.wled_source.outputs.ref }}`. Each
+            asset names both versions: its own RaceLink release and the WLED
+            release it wraps.
+
+            ### Flashing
+
+            * `…-app.bin` — application image. This is the file for WLED's
+              `/update` page and for the host's firmware-update dialog.
+            * `…-factory-usb-serial-only.bin` — bootloader, partition table,
+              OTA selector and application in one image, written at offset `0x0`.
+              **USB serial only.** Sent over OTA it is rejected in the normal
+              case, but with *Ignore firmware validation* ticked it is written
+              into the inactive slot and bricks the node until someone
+              re-flashes over serial. It also rewrites the partition table, so
+              WLED reformats its filesystem on the next boot: presets,
+              `cfg.json`, the master binding and the group id are all gone and
+              the node returns as unconfigured. A commissioning tool, never an
+              update tool.
+            * `…-bootloader.bin` / `…-partitions.bin` / `…-boot_app0.bin` — the
+              individual pieces, for flashing a blank chip manually.
+            * `…-assets.json` — machine-readable index: environment, chip,
+              device type, kind, flash offset, size and SHA-256 for every file.
           files: dist/*
 
       - name: Write workflow summary
@@ -251,6 +210,6 @@ jobs:
             echo "- Built environments:"
             while IFS= read -r env_name; do
               echo "  - \`${env_name}\`"
-            done < dist/built_envs.txt
+            done < built_envs.txt
             echo "- Trigger: \`workflow_dispatch\`"
           } >> "$GITHUB_STEP_SUMMARY"

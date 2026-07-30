@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -16,6 +18,12 @@ from scripts.release_profiles import (
     stage_profile_override,
     stage_release_assets,
 )
+from scripts.release_staging import write_release_index
+
+PRODUCT = "RaceLink_WLED"
+
+# Per-profile manifest fragments, assembled by `finalize` and removed again.
+FRAGMENT_DIR = ".staging"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -34,13 +42,32 @@ def _build_parser() -> argparse.ArgumentParser:
 
     stage_assets = subparsers.add_parser(
         "stage-assets",
-        help="Rename built WLED artifacts into RaceLink release assets.",
+        help="Stage one profile's build output as RaceLink release assets.",
     )
     stage_assets.add_argument("--profile", required=True, type=Path)
-    stage_assets.add_argument("--release-dir", required=True, type=Path)
+    stage_assets.add_argument(
+        "--build-root",
+        required=True,
+        type=Path,
+        help="PlatformIO build directory of the WLED checkout (.pio/build).",
+    )
     stage_assets.add_argument("--dist-dir", required=True, type=Path)
     stage_assets.add_argument("--release-version", required=True)
     stage_assets.add_argument("--wled-ref", required=True)
+    stage_assets.add_argument(
+        "--metadata",
+        required=True,
+        type=Path,
+        help="JSON from `pio project metadata`, collected while this profile is staged.",
+    )
+
+    finalize = subparsers.add_parser(
+        "finalize",
+        help="Write the assets.json sidecar and the SHA-256 manifest.",
+    )
+    finalize.add_argument("--dist-dir", required=True, type=Path)
+    finalize.add_argument("--release-version", required=True)
+    finalize.add_argument("--wled-ref", required=True)
 
     return parser
 
@@ -57,15 +84,55 @@ def _run_stage_profile(args: argparse.Namespace) -> int:
 
 
 def _run_stage_assets(args: argparse.Namespace) -> int:
-    staged = stage_release_assets(
+    dist_dir = args.dist_dir.resolve()
+    environments = stage_release_assets(
         profile_path=args.profile.resolve(),
-        release_dir=args.release_dir.resolve(),
-        dist_dir=args.dist_dir.resolve(),
+        build_root=args.build_root.resolve(),
+        dist_dir=dist_dir,
         release_version=args.release_version,
         wled_ref=args.wled_ref,
+        metadata=json.loads(args.metadata.resolve().read_text(encoding="utf-8")),
     )
-    for path in staged:
-        sys.stdout.write(f"{path}\n")
+
+    # Each profile is built and staged in turn, then its override file is
+    # overwritten by the next one -- so the manifest is accumulated on disk
+    # rather than held in memory, and assembled by `finalize` at the end.
+    fragments = dist_dir / FRAGMENT_DIR
+    fragments.mkdir(parents=True, exist_ok=True)
+    (fragments / f"{args.profile.stem}.json").write_text(
+        json.dumps(environments, indent=2) + "\n", encoding="utf-8"
+    )
+
+    for environment in environments:
+        for asset in environment["assets"]:
+            sys.stdout.write(f"{asset['file']}\n")
+    return 0
+
+
+def _run_finalize(args: argparse.Namespace) -> int:
+    dist_dir = args.dist_dir.resolve()
+    fragments = sorted((dist_dir / FRAGMENT_DIR).glob("*.json"))
+    if not fragments:
+        raise SystemExit(f"No staged profiles found in {dist_dir / FRAGMENT_DIR}")
+
+    environments = [
+        environment
+        for fragment in fragments
+        for environment in json.loads(fragment.read_text(encoding="utf-8"))
+    ]
+
+    manifest_path, checksum_path = write_release_index(
+        dist_dir=dist_dir,
+        product=PRODUCT,
+        version=args.release_version,
+        environments=environments,
+        extra={"wled_ref": args.wled_ref},
+    )
+
+    # The fragments are scaffolding, not release assets.
+    shutil.rmtree(dist_dir / FRAGMENT_DIR)
+
+    sys.stdout.write(f"{manifest_path.name}\n{checksum_path.name}\n")
     return 0
 
 
@@ -76,6 +143,8 @@ def main() -> int:
         return _run_stage_profile(args)
     if args.command == "stage-assets":
         return _run_stage_assets(args)
+    if args.command == "finalize":
+        return _run_finalize(args)
     parser.error(f"Unsupported command: {args.command}")
     return 2
 
