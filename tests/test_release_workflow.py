@@ -31,12 +31,18 @@ class ArtifactStagingTests(unittest.TestCase):
                 source = workflow.read_text(encoding="utf-8")
                 self.assertIn('python -m pip install "esptool>=5,<6"', source)
 
-    def test_metadata_is_collected_before_staging(self):
+    def test_metadata_is_collected_before_the_build(self):
+        # `pio project metadata` cleans the build directory, so collecting it
+        # after `pio run` deletes the firmware.bin that is about to be staged.
+        # Everything it reports is derived from the configuration, so the files
+        # it names do not have to exist yet.
         source = BUILD_SCRIPT.read_text(encoding="utf-8")
-        metadata = source.index("--json-output-path")
+        metadata = source.index("project metadata")
+        build = source.index("platformio run")
         staging = source.index("stage-assets")
 
-        self.assertLess(metadata, staging, "stage-assets reads metadata.json before it is written")
+        self.assertLess(metadata, build, "project metadata must run before the build")
+        self.assertLess(build, staging, "stage-assets needs the built firmware")
 
     def test_release_index_is_written_after_every_profile(self):
         source = BUILD_SCRIPT.read_text(encoding="utf-8")

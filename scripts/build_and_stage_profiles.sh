@@ -58,14 +58,17 @@ for profile in "${profiles[@]}"; do
     args+=("-e" "$env_name")
   done
 
-  python -m platformio run --project-dir "$wled_dir" "${args[@]}"
-
-  # Reports the pre-application images and the offsets the platform itself
-  # would flash them at, so no per-SoC offset table is needed downstream.
+  # Before the build, not after: `project metadata` cleans the build directory,
+  # so collecting it afterwards deletes the very firmware.bin about to be
+  # staged. Everything it reports is derived from the configuration -- the
+  # offsets, and paths like $BUILD_DIR/bootloader.bin -- so the files it names
+  # do not have to exist yet.
   python -m platformio project metadata \
     --project-dir "$wled_dir" \
     "${args[@]}" \
     --json-output-path "$repo_root/metadata.json"
+
+  python -m platformio run --project-dir "$wled_dir" "${args[@]}"
 
   python scripts/stage_wled_profile.py stage-assets \
     --profile "$repo_root/$profile" \
