@@ -706,6 +706,22 @@ private:
   // every value it actually had to write.
   void applyRaceLinkDefaults();
 
+  // Adopt an LED output configuration the web flasher seeded into NVS
+  // (see led_config_nvs.h): data pin, chip type and pixel count per bus.
+  // Called from setup() before applyRaceLinkDefaults(), because the
+  // seeded pixel total is what decides how far seg[0] has to reach.
+  // Does nothing when no seed is present — which is every boot except
+  // the first one after a flash, since the slot is consumed once it has
+  // been adopted.
+  void applySeededLedConfig();
+
+  // Set by applySeededLedConfig() once it has asked WLED to rebuild its
+  // busses. WLED performs that rebuild in loop() *after* it has called
+  // UsermodManager::loop(), and makeAutoSegments() rewrites the segments
+  // as part of it — so the RaceLink geometry has to be re-asserted on
+  // the following iteration.
+  bool ledSeedApplyPending = false;
+
   // Direct-effect visualisations (replace the legacy preset-11 pair feedback
   // and provide a boot-time fallback when the operator did not configure a
   // boot preset).

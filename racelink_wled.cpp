@@ -2,6 +2,7 @@
 //#include <WiFi.h>  // fallback for WiFi.macAddress()
 #include "pin_manager.h"
 #include "rf_config_nvs.h"
+#include "led_config_nvs.h"
 
 #ifdef RACELINK_EPAPER
 #include "racelink_epaper.h"
@@ -147,6 +148,11 @@ static UsermodRaceLink* s_gateSelf = nullptr;
 
 // ========= Setup =========
 void UsermodRaceLink::setup() {
+  // Adopt an LED layout the flasher seeded, before the defaults below run:
+  // it moves overrides.seg0Stop to the seeded pixel total, and
+  // applyRaceLinkDefaults() is what pushes that into seg[0].
+  applySeededLedConfig();
+
   // Re-apply fleet-uniformity defaults (FPS, ABL, gamma) before anything else
   // runs. By now WLED has deserialised cfg.json, so the affected globals carry
   // whatever the operator's saved config said — possibly drifted from the
@@ -283,6 +289,17 @@ void UsermodRaceLink::loop() {
   serviceHeadlessReassign(nowMs);
   serviceSceneRebroadcast(nowMs);
   serviceIndicator(nowMs);
+
+  // The bus rebuild requested by applySeededLedConfig() happens in WLED's
+  // loop *after* it has called UsermodManager::loop() (wled.cpp: usermods
+  // near the top, the doInitBusses block further down), and it ends in
+  // makeAutoSegments(), which rewrites the segments. So the first time we
+  // see doInitBusses cleared again, re-assert the RaceLink geometry over
+  // whatever auto-segmentation produced.
+  if (ledSeedApplyPending && !doInitBusses) {
+    ledSeedApplyPending = false;
+    applyRaceLinkDefaults();
+  }
 
 #if defined(RACELINK_ETH)
   if (!radioReady) return;
@@ -1211,6 +1228,98 @@ void UsermodRaceLink::applyRaceLinkDefaults() {
     configNeedsWrite = true;
     stateUpdated(CALL_MODE_NO_NOTIFY);
   }
+}
+
+// ========= Flash-time LED seed =========
+
+// WLED defines this in cfg.cpp, not in a header, so it is not in scope here.
+// The profiles all pass it as a build flag; the fallback matches the one
+// cfg.cpp applies, so a profile that ever drops the flag still compiles and
+// still agrees with what WLED's own default-bus path would have chosen.
+#ifndef DEFAULT_LED_COLOR_ORDER
+  #define DEFAULT_LED_COLOR_ORDER COL_ORDER_GRB
+#endif
+
+// Adopt an LED output configuration the web flasher wrote into NVS.
+//
+// This does not edit the compile-time DATA_PINS / LED_TYPES /
+// PIXEL_COUNTS: by the time a usermod's setup() runs, WLED has already
+// built its busses from them (wled.cpp: deserializeConfigFromFS →
+// beginStrip → UsermodManager::setup). What it does instead is hand WLED
+// a new bus list and request the same rebuild the LED settings page
+// triggers — `busConfigs` + `doInitBusses`. WLED's loop performs it and
+// sets configNeedsWrite, so the seeded layout lands in cfg.json and is
+// simply the device's configuration from then on.
+//
+// The slot is consumed once adopted (see led_config_nvs.h): that is what
+// keeps this a *default* rather than a permanent override, and it means a
+// layout that fails to come up cannot come back on the next boot.
+void UsermodRaceLink::applySeededLedConfig() {
+  LedConfigNvs::P_LedConfig cfg{};
+  if (!LedConfigNvs::load(cfg)) return;
+
+  // WLED_MAX_BUSSES is per profile — 1 on the C3 node, 2 everywhere else.
+  // A seed asking for more is clamped rather than rejected: one working
+  // strip is a better outcome than falling back to the compile default.
+  uint8_t busCount = cfg.bus_count;
+  if (busCount > WLED_MAX_BUSSES) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] LED seed wants %u bus(es), this build supports %u\n"),
+                   (unsigned)busCount, (unsigned)WLED_MAX_BUSSES);
+    busCount = WLED_MAX_BUSSES;
+  }
+
+  std::vector<BusConfig> staged;
+  uint16_t total = 0;
+  for (uint8_t i = 0; i < busCount; ++i) {
+    const LedConfigNvs::LedBus& b = cfg.bus[i];
+
+    // Bus and PinManager decide this, not a list duplicated in the
+    // header. A clocked (two-pin) type driven from a single pin would
+    // light nothing, and a pin that cannot drive an output cannot carry
+    // pixel data however plausible its number looks.
+    //
+    // Note what is *not* checked: PinManager::isPinAllocated(). The
+    // busses built from the compile-time defaults still hold their pins
+    // at this point and are released by the rebuild, so allocation would
+    // report a conflict against the very pins we are replacing.
+    if (!Bus::isDigital(b.type) || Bus::is2Pin(b.type)) {
+      DEBUG_PRINTF_P(PSTR("[RaceLink] LED seed bus %u: type %u is not a one-pin digital type; ignoring seed\n"),
+                     (unsigned)i, (unsigned)b.type);
+      LedConfigNvs::wipe();
+      return;
+    }
+    if (!PinManager::isPinOk(b.pin, /*output=*/true)) {
+      DEBUG_PRINTF_P(PSTR("[RaceLink] LED seed bus %u: GPIO %u cannot drive an output; ignoring seed\n"),
+                     (unsigned)i, (unsigned)b.pin);
+      LedConfigNvs::wipe();
+      return;
+    }
+
+    uint8_t pins[5] = {b.pin, 255, 255, 255, 255};
+    staged.push_back(BusConfig(b.type, pins, total, b.count,
+                               DEFAULT_LED_COLOR_ORDER, /*rev=*/false, /*skip=*/0,
+                               RGBW_MODE_MANUAL_ONLY, /*clock_kHz=*/0));
+    total += b.count;
+  }
+  if (staged.empty()) {
+    LedConfigNvs::wipe();
+    return;
+  }
+
+  busConfigs = std::move(staged);
+  doInitBusses = true;
+  ledSeedApplyPending = true;
+
+  // Segment geometry follows the strip. seg[0] spanning everything is the
+  // RaceLink convention (RACELINK_DEFAULT_SEG0_STOP is the compile-time
+  // pixel total, not a separate choice), and without moving it a seeded
+  // count would light only as far as the old default reached.
+  overrides.seg0Start = 0;
+  overrides.seg0Stop  = total;
+
+  LedConfigNvs::wipe();
+  DEBUG_PRINTF_P(PSTR("[RaceLink] adopted seeded LED config: %u bus(es), %u pixels total\n"),
+                 (unsigned)busCount, (unsigned)total);
 }
 
 // ========= Direct-effect visualisations =========
