@@ -25,7 +25,7 @@ struct Channel {
 struct Region {
   const char*    id;         // "EU868"
   const char*    label;      // "EU" -- what the info line and the dropdown show
-  uint16_t       band;       // 868 / 915, matched against the band-lock slot
+  uint16_t       band;       // 868 / 915 -- shown beside the label, not enforced
   const Channel* channels;
   uint8_t        count;
 };
@@ -60,22 +60,6 @@ static const uint8_t CHANNEL_NONE = 0;
 
 inline const Region* region(uint8_t index) {
   return index < REGION_COUNT ? &REGIONS[index] : nullptr;
-}
-
-// The region a band-lock slot names, or nullptr when the band is unknown or 0
-// (unlocked).
-inline const Region* regionForBand(uint16_t band) {
-  for (uint8_t i = 0; i < REGION_COUNT; ++i) {
-    if (REGIONS[i].band == band) return &REGIONS[i];
-  }
-  return nullptr;
-}
-
-inline uint8_t regionIndexForBand(uint16_t band) {
-  for (uint8_t i = 0; i < REGION_COUNT; ++i) {
-    if (REGIONS[i].band == band) return i;
-  }
-  return REGION_NONE;
 }
 
 inline const Channel* channel(uint8_t regionIndex, uint8_t channelId) {

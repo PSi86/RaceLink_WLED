@@ -24,10 +24,11 @@ HEADER = ROOT / "racelink_rf_channels.h"
 
 # Region id -> (short operator-facing label, band in MHz).
 #
-# The band is what the flasher writes into the band-lock slot and what
-# RfConfigNvs::store() checks a new configuration against. It matches the
-# `bands` entries in the flasher's data/devices.json, which is a hardware
-# property of a board -- a differently populated LoRa module.
+# The band is what the region dropdown shows beside its label ("EU (868 MHz)"),
+# and it matches the `bands` entries in the flasher's data/devices.json, which
+# is a hardware property of a board -- a differently populated LoRa module. It
+# is descriptive only: nothing on the device enforces it, because the host
+# configures a gateway's radio and has no region concept to enforce against.
 REGIONS = {
     "EU868": ("EU", 868),
     "US915": ("FCC", 915),
@@ -74,7 +75,7 @@ def render(table: dict) -> str:
         "struct Region {",
         "  const char*    id;         // \"EU868\"",
         "  const char*    label;      // \"EU\" -- what the info line and the dropdown show",
-        "  uint16_t       band;       // 868 / 915, matched against the band-lock slot",
+        "  uint16_t       band;       // 868 / 915 -- shown beside the label, not enforced",
         "  const Channel* channels;",
         "  uint8_t        count;",
         "};",
@@ -112,22 +113,6 @@ def render(table: dict) -> str:
             "",
             "inline const Region* region(uint8_t index) {",
             "  return index < REGION_COUNT ? &REGIONS[index] : nullptr;",
-            "}",
-            "",
-            "// The region a band-lock slot names, or nullptr when the band is unknown or 0",
-            "// (unlocked).",
-            "inline const Region* regionForBand(uint16_t band) {",
-            "  for (uint8_t i = 0; i < REGION_COUNT; ++i) {",
-            "    if (REGIONS[i].band == band) return &REGIONS[i];",
-            "  }",
-            "  return nullptr;",
-            "}",
-            "",
-            "inline uint8_t regionIndexForBand(uint16_t band) {",
-            "  for (uint8_t i = 0; i < REGION_COUNT; ++i) {",
-            "    if (REGIONS[i].band == band) return i;",
-            "  }",
-            "  return REGION_NONE;",
             "}",
             "",
             "inline const Channel* channel(uint8_t regionIndex, uint8_t channelId) {",

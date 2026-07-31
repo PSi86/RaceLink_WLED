@@ -1087,27 +1087,6 @@ bool UsermodRaceLink::radioInit() {
   if (!RfConfigNvs::load(g_activeRfConfig)) {
     g_activeRfConfig = getCompileDefaultRfConfig();
 
-    // Every profile compiles the EU default, so a board flashed as 915 and
-    // left without a slot would come up outside its own band -- and store()
-    // would then refuse to persist it, leaving nothing to read next boot.
-    // With a band lock we know better than the compile default: take the
-    // first channel of the region that lock names.
-    const uint16_t locked = RfConfigNvs::lockedBand();
-    if (locked != 0 && RfConfigNvs::bandOf(g_activeRfConfig.freq_hz) != locked) {
-      const RaceLinkChannels::Channel* c =
-          RaceLinkChannels::channel(RaceLinkChannels::regionIndexForBand(locked), 1);
-      if (c) {
-        g_activeRfConfig.freq_hz      = c->freq_hz;
-        g_activeRfConfig.bw_khz_x10   = c->bw_khz_x10;
-        g_activeRfConfig.sf           = c->sf;
-        g_activeRfConfig.cr_den       = c->cr_den;
-        g_activeRfConfig.sync_word    = c->sync_word;
-        g_activeRfConfig.tx_power_dbm = c->tx_power_dbm;
-        g_activeRfConfig.preamble     = c->preamble;
-        DEBUG_PRINTF_P(PSTR("[RaceLink] no RF slot; band lock %u MHz -> channel 1 (%lu Hz)\n"),
-                       (unsigned)locked, (unsigned long)c->freq_hz);
-      }
-    }
     RfConfigNvs::store(g_activeRfConfig);
   }
 
@@ -1360,14 +1339,9 @@ void UsermodRaceLink::applyRaceLinkDefaults() {
 
 void UsermodRaceLink::appendConfigData(Print& settingsScript) {
 #ifndef RACELINK_ETH
-  const uint16_t locked = RfConfigNvs::lockedBand();
-
   settingsScript.print(F("dd=addDropdown('RaceLink:RL_RF','region');"));
   for (uint8_t i = 0; i < RaceLinkChannels::REGION_COUNT; ++i) {
     const RaceLinkChannels::Region& r = RaceLinkChannels::REGIONS[i];
-    // A band-locked board is offered only its own region. Listing the other
-    // one would advertise a move store() is going to refuse.
-    if (locked != 0 && r.band != locked) continue;
     settingsScript.printf_P(PSTR("addOption(dd,'%s (%u MHz)',%u);"), r.label, (unsigned)r.band,
                             (unsigned)i);
   }
@@ -1417,11 +1391,10 @@ bool UsermodRaceLink::applyChannelFromSettings(uint8_t regionIndex, uint8_t chan
   p.tx_power_dbm = c->tx_power_dbm;
   p.preamble     = c->preamble;
 
-  // store() re-validates and enforces the band lock, so a 915 board cannot
-  // be talked onto an EU channel from its own settings page any more than
-  // it can over the air.
+  // store() re-validates, so a channel the firmware would not accept never
+  // reaches NVS and the node stays where it is.
   if (RfConfigNvs::store(p) != RaceLinkProto::RF_CHANGE_OK) {
-    DEBUG_PRINTF_P(PSTR("[RaceLink] refused channel %s/%u (%lu Hz) -- out of range or out of band\n"),
+    DEBUG_PRINTF_P(PSTR("[RaceLink] refused channel %s/%u (%lu Hz) -- out of range\n"),
                    RaceLinkChannels::REGIONS[regionIndex].id, (unsigned)channelId,
                    (unsigned long)c->freq_hz);
     return false;
