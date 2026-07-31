@@ -3,6 +3,7 @@
 #include "pin_manager.h"
 #include "rf_config_nvs.h"
 #include "led_config_nvs.h"
+#include "racelink_rf_channels.h"
 
 #ifdef RACELINK_EPAPER
 #include "racelink_epaper.h"
@@ -271,6 +272,11 @@ void UsermodRaceLink::setup() {
   if (overrides.headlessPersistedActive) {
     headlessResumePending = true;
   }
+
+  // From here on a readFromConfig() call is an operator saving the settings
+  // page, not WLED reading cfg.json at boot -- so a changed radio channel
+  // may be acted on. See readFromConfig() for why the distinction matters.
+  bootConfigDone = true;
 }
 
 // ========= Loop =========
@@ -370,6 +376,26 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
     snprintf(initMsg, sizeof(initMsg), "%s (code %d)", radioReady ? "OK" : "FAIL", (int)radioInitCode);
     JsonArray row = user.createNestedArray(F("RaceLink Init"));
     row.add(initMsg);
+  }
+
+  // The channel the radio is actually on. Nothing else on the device shows
+  // it: the settings page renders what was last saved, and a node that is
+  // on the wrong channel is precisely the one you cannot ask over the air.
+  {
+    char line[48];
+    const RaceLinkChannels::Region* r = RaceLinkChannels::region(cfgRegionIndex);
+    const unsigned long mhz = g_activeRfConfig.freq_hz / 1000000UL;
+    const unsigned long khz = (g_activeRfConfig.freq_hz % 1000000UL) / 1000UL;
+    if (r && cfgChannelId != RaceLinkChannels::CHANNEL_NONE) {
+      snprintf(line, sizeof(line), "%s · Ch %u · %lu.%03lu MHz",
+               r->label, (unsigned)cfgChannelId, mhz, khz);
+    } else {
+      // Set to something outside the table, over the air. Say so rather
+      // than rounding it to the nearest channel.
+      snprintf(line, sizeof(line), "custom · %lu.%03lu MHz", mhz, khz);
+    }
+    JsonArray row = user.createNestedArray(F("RaceLink LoRa"));
+    row.add(line);
   }
 #endif
 
@@ -571,14 +597,26 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
   top["masterFullMac"] = persistedMasterFull6Known ? String(m6) : String("");
 
 #ifndef RACELINK_ETH
-  // radio defaults (LoRa builds only)
+  // ---- Radio channel (LoRa builds only) --------------------------------
+  //
+  // These two fields used to be six read-only copies of the compile-time
+  // macros -- they showed 867.7 MHz on every device regardless of what the
+  // radio was actually doing, and readFromConfig() never looked at them.
+  // They now show the channel the node is really on, and changing them
+  // moves it. That matters for exactly one situation: a node stranded on a
+  // channel no gateway is using can be reached over its own WiFi AP and put
+  // back, instead of being re-flashed.
+  //
+  // What is written here never reaches the radio by itself. NVS is the only
+  // source radioInit() reads, because NVS is the one store that survives
+  // both a WLED factory reset (which formats the filesystem) and the host's
+  // cfg.json deploy (which replaces the file wholesale) -- and losing the
+  // channel is what makes a node unreachable. So this is a control surface:
+  // readFromConfig() turns a change here into the same NVS write and reboot
+  // that a gateway's OPC_RF_CONFIG performs.
   JsonObject l = top.createNestedObject("RL_RF");
-  l["freq"] = RACELINK_FREQ_HZ;
-  l["sf"]   = RACELINK_SF;
-  l["bw"]   = (int)RACELINK_BW_KHZ;
-  l["cr"]   = RACELINK_CR;
-  l["sync"] = RACELINK_SYNC_WORD;
-  l["txp"]  = RACELINK_TX_POWER;
+  l["region"]  = cfgRegionIndex;
+  l["channel"] = cfgChannelId;
 
   // RaceLink radio control pins. Defaults match the build profile (see
   // RACELINK_PIN_* macros in racelink_wled.h). Saved values are loaded into
@@ -683,6 +721,39 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
   getJsonValue(top["groupId"], current.groupId, 0);
   getJsonValue(top["macFilterEnabled"], macFilterEnabled, true);
   getJsonValue(top["macFilterPersist"], macFilterPersist, false);
+
+#ifndef RACELINK_ETH
+  // ---- Radio channel ---------------------------------------------------
+  //
+  // Read into the members first, always: addToConfig() renders from them,
+  // and radioInit() compares them against NVS to spot a channel that moved
+  // by some other route.
+  //
+  // Acting on a change is gated on bootConfigDone, and that gate is the one
+  // thing that makes this field different from every other setting here.
+  // readFromConfig() also runs at boot, from deserializeConfigFromFS(),
+  // before radioInit() has loaded anything -- reacting to a "difference"
+  // there would write NVS and reboot on every single boot. The radio pins
+  // sidestep this by not acting at all: they are consumed later by
+  // radioInit(). A channel has to act, so it waits until setup() is done.
+  {
+    uint8_t wantRegion = cfgRegionIndex;
+    uint8_t wantChannel = cfgChannelId;
+    getJsonValue(top["RL_RF"]["region"], wantRegion, cfgRegionIndex);
+    getJsonValue(top["RL_RF"]["channel"], wantChannel, cfgChannelId);
+
+    const bool changed = (wantRegion != cfgRegionIndex) || (wantChannel != cfgChannelId);
+    if (bootConfigDone && changed && wantChannel != RaceLinkChannels::CHANNEL_NONE) {
+      // Does not return when it succeeds -- it reboots onto the new channel.
+      if (!applyChannelFromSettings(wantRegion, wantChannel)) {
+        DEBUG_PRINTLN(F("[RaceLink] channel change rejected; leaving the radio as it is"));
+      }
+    } else if (!bootConfigDone) {
+      cfgRegionIndex = wantRegion;
+      cfgChannelId   = wantChannel;
+    }
+  }
+#endif
 
   #if defined(RACELINK_STARTBLOCK)
     uint8_t slots = numberOfSlots;
@@ -1015,7 +1086,62 @@ bool UsermodRaceLink::radioInit() {
   //      there yet".
   if (!RfConfigNvs::load(g_activeRfConfig)) {
     g_activeRfConfig = getCompileDefaultRfConfig();
+
+    // Every profile compiles the EU default, so a board flashed as 915 and
+    // left without a slot would come up outside its own band -- and store()
+    // would then refuse to persist it, leaving nothing to read next boot.
+    // With a band lock we know better than the compile default: take the
+    // first channel of the region that lock names.
+    const uint16_t locked = RfConfigNvs::lockedBand();
+    if (locked != 0 && RfConfigNvs::bandOf(g_activeRfConfig.freq_hz) != locked) {
+      const RaceLinkChannels::Channel* c =
+          RaceLinkChannels::channel(RaceLinkChannels::regionIndexForBand(locked), 1);
+      if (c) {
+        g_activeRfConfig.freq_hz      = c->freq_hz;
+        g_activeRfConfig.bw_khz_x10   = c->bw_khz_x10;
+        g_activeRfConfig.sf           = c->sf;
+        g_activeRfConfig.cr_den       = c->cr_den;
+        g_activeRfConfig.sync_word    = c->sync_word;
+        g_activeRfConfig.tx_power_dbm = c->tx_power_dbm;
+        g_activeRfConfig.preamble     = c->preamble;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] no RF slot; band lock %u MHz -> channel 1 (%lu Hz)\n"),
+                       (unsigned)locked, (unsigned long)c->freq_hz);
+      }
+    }
     RfConfigNvs::store(g_activeRfConfig);
+  }
+
+  // Which channel are we on? The stored identity is authoritative when it
+  // is there; a config that arrived over LoRa carries PHY values only, so
+  // it gets identified here -- or is honestly reported as custom.
+  {
+    uint8_t regionIndex, channelId;
+    if (!RfConfigNvs::loadIdentity(regionIndex, channelId)) {
+      RaceLinkChannels::identify(g_activeRfConfig.freq_hz, g_activeRfConfig.bw_khz_x10,
+                                 g_activeRfConfig.sf, g_activeRfConfig.cr_den,
+                                 g_activeRfConfig.sync_word, g_activeRfConfig.tx_power_dbm,
+                                 g_activeRfConfig.preamble, regionIndex, channelId);
+      RfConfigNvs::storeIdentity(regionIndex, channelId);
+    }
+
+    // cfg.json carries the channel the last settings save left behind. If
+    // NVS disagrees, the channel moved by a route that never touched the
+    // settings page -- a flash-time seed, in practice. That is a network
+    // move like any other, so the learned master, which belongs to the old
+    // channel, must not be re-adopted. Same reasoning as the OPC_RF_CONFIG
+    // handler, which does this for the over-the-air case.
+    if (cfgChannelId != RaceLinkChannels::CHANNEL_NONE &&
+        (cfgRegionIndex != regionIndex || cfgChannelId != channelId)) {
+      DEBUG_PRINTF_P(PSTR("[RaceLink] channel changed outside the UI (cfg %u/%u -> nvs %u/%u); "
+                          "dropping the persisted master\n"),
+                     (unsigned)cfgRegionIndex, (unsigned)cfgChannelId,
+                     (unsigned)regionIndex, (unsigned)channelId);
+      macFilterPersist = false;
+      clearMaster();
+      configNeedsWrite = true;
+    }
+    cfgRegionIndex = regionIndex;
+    cfgChannelId   = channelId;
   }
 
   RaceLinkTransport::PhyCfg phy;
@@ -1229,6 +1355,101 @@ void UsermodRaceLink::applyRaceLinkDefaults() {
     stateUpdated(CALL_MODE_NO_NOTIFY);
   }
 }
+
+// ========= Settings-page dropdowns =========
+
+void UsermodRaceLink::appendConfigData(Print& settingsScript) {
+#ifndef RACELINK_ETH
+  const uint16_t locked = RfConfigNvs::lockedBand();
+
+  settingsScript.print(F("dd=addDropdown('RaceLink:RL_RF','region');"));
+  for (uint8_t i = 0; i < RaceLinkChannels::REGION_COUNT; ++i) {
+    const RaceLinkChannels::Region& r = RaceLinkChannels::REGIONS[i];
+    // A band-locked board is offered only its own region. Listing the other
+    // one would advertise a move store() is going to refuse.
+    if (locked != 0 && r.band != locked) continue;
+    settingsScript.printf_P(PSTR("addOption(dd,'%s (%u MHz)',%u);"), r.label, (unsigned)r.band,
+                            (unsigned)i);
+  }
+
+  settingsScript.print(F("dd=addDropdown('RaceLink:RL_RF','channel');"));
+  // "custom" only exists as an option when the node actually is on one --
+  // a configuration set over the air to values outside the table. Picking
+  // it changes nothing; it is there so the select has something true to
+  // show instead of silently displaying channel 1.
+  if (cfgChannelId == RaceLinkChannels::CHANNEL_NONE) {
+    settingsScript.print(F("addOption(dd,'— custom (unchanged) —',0);"));
+  }
+  // Channel numbers and names are the same in every region -- only the
+  // frequencies differ, and the region field is what picks between them.
+  const RaceLinkChannels::Region& first = RaceLinkChannels::REGIONS[0];
+  for (uint8_t j = 0; j < first.count; ++j) {
+    const RaceLinkChannels::Channel& c = first.channels[j];
+    settingsScript.printf_P(PSTR("addOption(dd,'%u — %s',%u);"), (unsigned)c.id, c.name,
+                            (unsigned)c.id);
+  }
+
+  // The frequency is not editable, so it is not a field -- but without it
+  // the two dropdowns never say what they actually mean in MHz.
+  settingsScript.printf_P(PSTR("addInfo('RaceLink:RL_RF:channel',1,'now %lu.%03lu MHz');"),
+                          (unsigned long)(g_activeRfConfig.freq_hz / 1000000UL),
+                          (unsigned long)((g_activeRfConfig.freq_hz % 1000000UL) / 1000UL));
+#endif
+}
+
+// ========= RF channel from the settings page =========
+
+#ifndef RACELINK_ETH
+bool UsermodRaceLink::applyChannelFromSettings(uint8_t regionIndex, uint8_t channelId) {
+  const RaceLinkChannels::Channel* c = RaceLinkChannels::channel(regionIndex, channelId);
+  if (!c) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] settings named channel %u/%u, which is not in the table\n"),
+                   (unsigned)regionIndex, (unsigned)channelId);
+    return false;
+  }
+
+  RaceLinkProto::P_RfConfig p{};
+  p.freq_hz      = c->freq_hz;
+  p.bw_khz_x10   = c->bw_khz_x10;
+  p.sf           = c->sf;
+  p.cr_den       = c->cr_den;
+  p.sync_word    = c->sync_word;
+  p.tx_power_dbm = c->tx_power_dbm;
+  p.preamble     = c->preamble;
+
+  // store() re-validates and enforces the band lock, so a 915 board cannot
+  // be talked onto an EU channel from its own settings page any more than
+  // it can over the air.
+  if (RfConfigNvs::store(p) != RaceLinkProto::RF_CHANGE_OK) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] refused channel %s/%u (%lu Hz) -- out of range or out of band\n"),
+                   RaceLinkChannels::REGIONS[regionIndex].id, (unsigned)channelId,
+                   (unsigned long)c->freq_hz);
+    return false;
+  }
+  RfConfigNvs::storeIdentity(regionIndex, channelId);
+  g_activeRfConfig = p;
+
+  // A channel change is a network move, so the learned master -- which
+  // lives on the old channel and will not be heard on the new one -- must
+  // not be re-adopted at the next boot. Without this the node comes up
+  // reachable and still refuses every packet from the gateway that is
+  // actually there. Identical to what the OPC_RF_CONFIG handler does; the
+  // reasoning is spelled out there.
+  macFilterPersist = false;
+  configNeedsWrite = true;
+  serializeConfigToFS();
+
+  DEBUG_PRINTF_P(PSTR("[RaceLink] channel set from settings: %s ch%u (%lu Hz), rebooting\n"),
+                 RaceLinkChannels::REGIONS[regionIndex].id, (unsigned)channelId,
+                 (unsigned long)c->freq_hz);
+
+  // Same as the over-the-air path: RadioLib has no clean mid-flight PHY
+  // reset, and a reboot is a brief, visible outage on one device.
+  delay(50);
+  ESP.restart();
+  return true;
+}
+#endif  // !RACELINK_ETH
 
 // ========= Flash-time LED seed =========
 

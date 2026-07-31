@@ -335,6 +335,13 @@ public:
   // ----- WLED Usermod API -----
   void setup() override;
   void loop() override;
+
+  // Turns the RL_RF region/channel fields into dropdowns on the Usermods
+  // settings page, so the choice offered there is the same one the web
+  // flasher offers instead of six raw numbers. When the board carries a
+  // band lock, only that band's region is listed -- the setting the
+  // firmware would refuse anyway is not worth showing.
+  void appendConfigData(Print& settingsScript) override;
   void handleOverlayDraw() override;
   void addToJsonInfo(JsonObject& root) override;
   void addToConfig(JsonObject& root) override;
@@ -715,12 +722,40 @@ private:
   // been adopted.
   void applySeededLedConfig();
 
+  // Apply a channel picked in the WLED usermod settings. Takes the same
+  // route an OPC_RF_CONFIG from a gateway takes -- validate, persist to
+  // NVS, drop the learned master, flush cfg.json, reboot -- because a
+  // channel change over the air and a channel change over the AP are the
+  // same event: the node moves to a different network, and the gateway it
+  // knew is on the old one. Returns false and leaves everything alone when
+  // the channel is not one this board may use.
+  bool applyChannelFromSettings(uint8_t regionIndex, uint8_t channelId);
+
   // Set by applySeededLedConfig() once it has asked WLED to rebuild its
   // busses. WLED performs that rebuild in loop() *after* it has called
   // UsermodManager::loop(), and makeAutoSegments() rewrites the segments
   // as part of it — so the RaceLink geometry has to be re-asserted on
   // the following iteration.
   bool ledSeedApplyPending = false;
+
+  // ---- RF channel, as the settings page sees it -------------------------
+  //
+  // The channel identity read out of cfg.json by readFromConfig(). It is
+  // *not* applied to the radio — NVS is the only source for that, because
+  // it is the only one of the two stores that a WLED factory reset and the
+  // host's cfg.json deploy both leave alone, and losing the channel is what
+  // makes a node unreachable. These two exist so the settings page has
+  // something to render and edit, and so radioInit() can notice a channel
+  // that changed by some other route.
+  uint8_t cfgRegionIndex = 0xFF;
+  uint8_t cfgChannelId   = 0;
+
+  // False until setup() has finished. readFromConfig() also runs at boot,
+  // from deserializeConfigFromFS(), long before radioInit() has loaded
+  // anything — acting on a "change" there would rewrite NVS and reboot on
+  // every single boot. The radio pins avoid this by not acting at all;
+  // a channel change has to act, so it waits for this.
+  bool bootConfigDone = false;
 
   // Direct-effect visualisations (replace the legacy preset-11 pair feedback
   // and provide a boot-time fallback when the operator did not configure a
