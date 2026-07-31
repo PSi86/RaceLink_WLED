@@ -36,10 +36,13 @@ class ArtifactStagingTests(unittest.TestCase):
         # after `pio run` deletes the firmware.bin that is about to be staged.
         # Everything it reports is derived from the configuration, so the files
         # it names do not have to exist yet.
+        # Match the invocations, not bare subcommand words: those turn up in
+        # comments too, and an ordering guard that a comment can move is not a
+        # guard.
         source = BUILD_SCRIPT.read_text(encoding="utf-8")
-        metadata = source.index("project metadata")
+        metadata = source.index("platformio project metadata")
         build = source.index("platformio run")
-        staging = source.index("stage-assets")
+        staging = source.index("stage_wled_profile.py stage-assets")
 
         self.assertLess(metadata, build, "project metadata must run before the build")
         self.assertLess(build, staging, "stage-assets needs the built firmware")
@@ -47,7 +50,10 @@ class ArtifactStagingTests(unittest.TestCase):
     def test_release_index_is_written_after_every_profile(self):
         source = BUILD_SCRIPT.read_text(encoding="utf-8")
 
-        self.assertLess(source.index("stage-assets"), source.index("finalize"))
+        self.assertLess(
+            source.index("stage_wled_profile.py stage-assets"),
+            source.index("stage_wled_profile.py finalize"),
+        )
 
     def test_built_envs_list_is_kept_out_of_the_published_directory(self):
         # dist/ is published wholesale; scaffolding in there would ship.
@@ -69,6 +75,16 @@ class ArtifactStagingTests(unittest.TestCase):
 
         self.assertIn("USB serial only", source)
         self.assertIn("commissioning tool, never an update tool", source)
+
+    def test_release_notes_do_not_promise_files_that_no_longer_ship(self):
+        # The bootloader, partition table and OTA selector are merged into the
+        # factory image and no longer published on their own. Notes that still
+        # list them send people looking for assets that are not there.
+        source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+        for gone in ("-bootloader.bin", "-partitions.bin", "-boot_app0.bin", "-sha256.txt"):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, source)
 
     def test_build_workflow_publishes_nothing(self):
         source = BUILD_WORKFLOW.read_text(encoding="utf-8")

@@ -143,36 +143,23 @@ def stage_local_usermod(*, repo_root: Path, wled_dir: Path) -> Path:
     return target_dir
 
 
-def sanitize_ref_for_filename(raw_ref: str) -> str:
-    """Convert a WLED ref into a stable filename fragment."""
-    value = re.sub(r"[^0-9A-Za-z._-]+", "-", str(raw_ref).strip())
-    value = re.sub(r"-{2,}", "-", value).strip("-")
-    return value or "unknown-ref"
-
-
-def wled_variant(wled_ref: str) -> str:
-    """Filename fragment naming the upstream release a build wraps.
-
-    One dash-free field, so an asset states both its own RaceLink version and
-    the WLED version it was built against without making the name ambiguous.
-    """
-    return f"wled_{sanitize_ref_for_filename(wled_ref)}"
-
-
 def stage_release_assets(
     *,
     profile_path: Path,
     build_root: Path,
     dist_dir: Path,
     release_version: str,
-    wled_ref: str,
     metadata: dict,
-    product: str = "RaceLink_WLED",
 ) -> list[dict]:
     """Stage every asset for one profile's environments.
 
-    Returns a manifest entry per environment; the caller accumulates them
-    across profiles and writes the release index once.
+    Returns a sidecar entry per environment; the caller accumulates them across
+    profiles and writes the release index once.
+
+    The upstream WLED release a build wraps is no longer part of the filenames.
+    It is recorded once per release as ``wled_ref`` in the assets.json sidecar,
+    which is where every consumer already read it from -- repeating it in each
+    of thirty filenames only made them longer.
 
     Note the source: PlatformIO's build directory, not WLED's
     ``build_output/release``. Both hold the same application image, but the
@@ -181,17 +168,14 @@ def stage_release_assets(
     metadata point at.
     """
     dist_dir.mkdir(parents=True, exist_ok=True)
-    variant = wled_variant(wled_ref)
 
     return [
         stage_environment(
             env=env.name,
-            product=product,
             version=release_version,
             build_dir=build_root / env.name,
             dist_dir=dist_dir,
             metadata=metadata,
-            variant=variant,
         )
         for env in parse_profile_environments(profile_path)
     ]

@@ -70,12 +70,13 @@ for profile in "${profiles[@]}"; do
 
   python -m platformio run --project-dir "$wled_dir" "${args[@]}"
 
+  # No --wled-ref here: the upstream ref is a release-level fact and is
+  # recorded once by `finalize`, not per staged profile.
   python scripts/stage_wled_profile.py stage-assets \
     --profile "$repo_root/$profile" \
     --build-root "$wled_dir/.pio/build" \
     --dist-dir "$dist_dir" \
     --release-version "$release_version" \
-    --wled-ref "$wled_ref" \
     --metadata "$repo_root/metadata.json"
 
   echo "::endgroup::"

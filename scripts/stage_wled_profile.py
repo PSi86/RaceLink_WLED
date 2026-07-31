@@ -53,7 +53,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stage_assets.add_argument("--dist-dir", required=True, type=Path)
     stage_assets.add_argument("--release-version", required=True)
-    stage_assets.add_argument("--wled-ref", required=True)
     stage_assets.add_argument(
         "--metadata",
         required=True,
@@ -61,9 +60,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="JSON from `pio project metadata`, collected while this profile is staged.",
     )
 
+    # The WLED ref is a release-level fact, recorded once in the sidecar --
+    # staging a profile does not need to know it.
     finalize = subparsers.add_parser(
         "finalize",
-        help="Write the assets.json sidecar and the SHA-256 manifest.",
+        help="Write the assets.json sidecar.",
     )
     finalize.add_argument("--dist-dir", required=True, type=Path)
     finalize.add_argument("--release-version", required=True)
@@ -90,12 +91,11 @@ def _run_stage_assets(args: argparse.Namespace) -> int:
         build_root=args.build_root.resolve(),
         dist_dir=dist_dir,
         release_version=args.release_version,
-        wled_ref=args.wled_ref,
         metadata=json.loads(args.metadata.resolve().read_text(encoding="utf-8")),
     )
 
     # Each profile is built and staged in turn, then its override file is
-    # overwritten by the next one -- so the manifest is accumulated on disk
+    # overwritten by the next one -- so the sidecar is accumulated on disk
     # rather than held in memory, and assembled by `finalize` at the end.
     fragments = dist_dir / FRAGMENT_DIR
     fragments.mkdir(parents=True, exist_ok=True)
@@ -121,7 +121,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         for environment in json.loads(fragment.read_text(encoding="utf-8"))
     ]
 
-    manifest_path, checksum_path = write_release_index(
+    manifest_path = write_release_index(
         dist_dir=dist_dir,
         product=PRODUCT,
         version=args.release_version,
@@ -132,7 +132,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
     # The fragments are scaffolding, not release assets.
     shutil.rmtree(dist_dir / FRAGMENT_DIR)
 
-    sys.stdout.write(f"{manifest_path.name}\n{checksum_path.name}\n")
+    sys.stdout.write(f"{manifest_path.name}\n")
     return 0
 
 

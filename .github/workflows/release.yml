@@ -174,15 +174,21 @@ jobs:
           target_commitish: ${{ inputs.target_branch }}
           generate_release_notes: true
           body: |
-            Built against WLED `${{ steps.wled_source.outputs.ref }}`. Each
-            asset names both versions: its own RaceLink release and the WLED
-            release it wraps.
+            Built against WLED `${{ steps.wled_source.outputs.ref }}`, recorded
+            once as `wled_ref` in `…-assets.json` rather than repeated in every
+            filename.
 
             ### Flashing
 
-            * `…-app.bin` — application image. This is the file for WLED's
-              `/update` page and for the host's firmware-update dialog.
-            * `…-factory-usb-serial-only.bin` — bootloader, partition table,
+            The easiest route for a blank board is the web flasher at
+            <https://fw.racelink.dev/>, which picks the right image for the
+            model and sets the radio channel while it writes. The files below
+            are for flashing by hand.
+
+            * `<env>-<version>-ota.bin` — application image. This is the file
+              for WLED's `/update` page and for the host's firmware-update
+              dialog.
+            * `<env>-<version>-usbflash.bin` — bootloader, partition table,
               OTA selector and application in one image, written at offset `0x0`.
               **USB serial only.** Sent over OTA it is rejected in the normal
               case, but with *Ignore firmware validation* ticked it is written
@@ -192,10 +198,16 @@ jobs:
               `cfg.json`, the master binding and the group id are all gone and
               the node returns as unconfigured. A commissioning tool, never an
               update tool.
-            * `…-bootloader.bin` / `…-partitions.bin` / `…-boot_app0.bin` — the
-              individual pieces, for flashing a blank chip manually.
             * `…-assets.json` — machine-readable index: environment, chip,
-              device type, kind, flash offset, size and SHA-256 for every file.
+              device type, flash offset, size and SHA-256 for every file, plus
+              a `parts` list giving the layout of the blocks merged into the
+              factory image.
+
+            Filenames no longer repeat the product, the device type, the WLED
+            release or the checksum file; every one of those is in
+            `…-assets.json`. The bootloader, partition table and OTA selector
+            are no longer published separately — `esptool write_flash 0x0
+            <env>-<version>-usbflash.bin` reaches the same state in one write.
           files: dist/*
 
       - name: Write workflow summary
