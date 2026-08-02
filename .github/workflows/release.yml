@@ -18,6 +18,11 @@ on:
         required: false
         default: ""
         type: string
+      wled_patch_prs:
+        description: "Optional wled/WLED pull requests to apply on top of that ref, e.g. 5521 or 5521,5533."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -109,6 +114,20 @@ jobs:
           path: external/WLED
           fetch-depth: 1
 
+      # Same step, same order as build.yml -- the rehearsal has to see the tree
+      # the release builds. `git apply` is strict on purpose: a patch that no
+      # longer fits the tagged release fails here rather than in the compiler.
+      - name: Apply WLED pull requests
+        id: wled_patches
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ref="$(python scripts/apply_wled_patches.py \
+            --wled-dir external/WLED \
+            --wled-ref "${{ steps.wled_source.outputs.ref }}" \
+            --patch-prs "${{ inputs.wled_patch_prs }}")"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
@@ -131,7 +150,7 @@ jobs:
         shell: bash
         env:
           RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
-          WLED_REF: ${{ steps.wled_source.outputs.ref }}
+          WLED_REF: ${{ steps.wled_patches.outputs.ref }}
         run: |
           bash scripts/build_and_stage_profiles.sh \
             "$GITHUB_WORKSPACE" \
@@ -174,9 +193,10 @@ jobs:
           target_commitish: ${{ inputs.target_branch }}
           generate_release_notes: true
           body: |
-            Built against WLED `${{ steps.wled_source.outputs.ref }}`, recorded
+            Built against WLED `${{ steps.wled_patches.outputs.ref }}`, recorded
             once as `wled_ref` in `…-assets.json` rather than repeated in every
-            filename.
+            filename. A `+wled/WLED#<n>` suffix means that pull request was
+            applied on top of the tag before building.
 
             ### Flashing
 
@@ -218,7 +238,7 @@ jobs:
             echo
             echo "- RaceLink_WLED version: \`${{ steps.release_version.outputs.version }}\`"
             echo "- RaceLink_WLED tag: \`${{ steps.release_version.outputs.tag }}\`"
-            echo "- WLED ref: \`${{ steps.wled_source.outputs.ref }}\`"
+            echo "- WLED ref: \`${{ steps.wled_patches.outputs.ref }}\`"
             echo "- Built environments:"
             while IFS= read -r env_name; do
               echo "  - \`${env_name}\`"

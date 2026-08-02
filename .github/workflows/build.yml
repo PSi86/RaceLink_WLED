@@ -20,6 +20,11 @@ on:
         required: false
         default: ""
         type: string
+      wled_patch_prs:
+        description: "Optional wled/WLED pull requests to apply on top of that ref, e.g. 5521 or 5521,5533."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -65,6 +70,20 @@ jobs:
           path: external/WLED
           fetch-depth: 1
 
+      # Before npm and PlatformIO see the tree: a pull request may touch
+      # package-lock.json or platformio.ini. With no pull requests to apply this
+      # echoes the ref back unchanged and touches nothing, so it needs no `if:`.
+      - name: Apply WLED pull requests
+        id: wled_patches
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ref="$(python scripts/apply_wled_patches.py \
+            --wled-dir external/WLED \
+            --wled-ref "${{ steps.wled_source.outputs.ref }}" \
+            --patch-prs "${{ inputs.wled_patch_prs }}")"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
@@ -99,7 +118,7 @@ jobs:
             "$GITHUB_WORKSPACE" \
             "$GITHUB_WORKSPACE/external/WLED" \
             "0.0.0-ci" \
-            "${{ steps.wled_source.outputs.ref }}" \
+            "${{ steps.wled_patches.outputs.ref }}" \
             "$GITHUB_WORKSPACE/dist"
 
       - name: Verify the staged factory images

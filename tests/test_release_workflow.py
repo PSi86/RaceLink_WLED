@@ -86,6 +86,46 @@ class ArtifactStagingTests(unittest.TestCase):
             with self.subTest(gone=gone):
                 self.assertNotIn(gone, source)
 
+    def test_both_workflows_can_apply_upstream_pull_requests(self):
+        for workflow in (BUILD_WORKFLOW, RELEASE_WORKFLOW):
+            with self.subTest(workflow=workflow.name):
+                source = workflow.read_text(encoding="utf-8")
+                self.assertIn("wled_patch_prs:", source)
+                self.assertIn("scripts/apply_wled_patches.py", source)
+
+    def test_pull_requests_are_applied_before_anything_reads_the_tree(self):
+        # A patch may touch package-lock.json or platformio.ini, so it has to
+        # land before npm and PlatformIO are set up against that checkout.
+        for workflow in (BUILD_WORKFLOW, RELEASE_WORKFLOW):
+            with self.subTest(workflow=workflow.name):
+                source = workflow.read_text(encoding="utf-8")
+                checkout = source.index("path: external/WLED")
+                patches = source.index("scripts/apply_wled_patches.py")
+                node = source.index("Set up Node.js")
+
+                self.assertLess(checkout, patches, "nothing to patch before checkout")
+                self.assertLess(patches, node, "npm must see the patched tree")
+
+    def test_the_recorded_wled_ref_accounts_for_applied_patches(self):
+        # This is the silent one: the sidecar's `wled_ref` and the release
+        # notes are what anyone later uses to work out what an image contains.
+        # Passing the raw ref on would let a patched build claim to be a stock
+        # release of the tag it was built from.
+        for workflow in (BUILD_WORKFLOW, RELEASE_WORKFLOW):
+            with self.subTest(workflow=workflow.name):
+                source = workflow.read_text(encoding="utf-8")
+                self.assertIn("steps.wled_patches.outputs.ref", source)
+
+        release = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("WLED_REF: ${{ steps.wled_patches.outputs.ref }}", release)
+        self.assertIn(
+            "Built against WLED `${{ steps.wled_patches.outputs.ref }}`",
+            release,
+        )
+
+        # The checkout still needs the real ref -- the label is not a git ref.
+        self.assertIn("ref: ${{ steps.wled_source.outputs.ref }}", release)
+
     def test_build_workflow_publishes_nothing(self):
         source = BUILD_WORKFLOW.read_text(encoding="utf-8")
 
