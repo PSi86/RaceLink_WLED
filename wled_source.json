@@ -1,0 +1,24 @@
+{
+  "ref": "v16.0.1",
+  "patch_prs": [5521],
+  "notes": [
+    "The WLED sources a RaceLink firmware image is built from. Both workflows",
+    "read this file, so the compile-only build on a pull request rehearses the",
+    "exact tree a release would ship -- which it does not do when the upstream",
+    "ref is resolved fresh on every run.",
+    "",
+    "ref: a wled/WLED tag, or the string 'latest' to resolve the newest",
+    "published upstream release at build time. A pinned tag is the point: WLED",
+    "17 switches the shared esp32/esp32s2/esp32s3/esp32c3 build sections from",
+    "ESP-IDF 4.4 to 5.5, and every RaceLink profile inherits from them. With",
+    "'latest' that toolchain jump would land in a release without a commit here.",
+    "",
+    "patch_prs: upstream pull requests applied on top of that tag, in order.",
+    "  5521 -- 'Integrate um_data structure to battery usermod'. Still open.",
+    "          Without it usermods/Battery exposes no um_data, so the RaceLink",
+    "          usermod's getUMData(USERMOD_ID_BATTERY) never succeeds and the",
+    "          node reports no battery state -- silently, since the lookup is",
+    "          retried rather than failed. Watch wled/WLED#5399, which rewrites",
+    "          the same file: once it merges this patch stops applying."
+  ]
+}

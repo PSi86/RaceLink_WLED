@@ -4,8 +4,9 @@ name: Build Firmware
 # ever built this repo, and it tags and publishes in the same run — so a broken
 # build or a broken staging step surfaced in the middle of a real release.
 #
-# This job runs the identical build-and-stage script against the latest
-# published WLED release, verifies the resulting factory images, and ships
+# This job runs the identical build-and-stage script against the WLED sources
+# pinned in wled_source.json -- the same ref and the same upstream patches a
+# release would build -- verifies the resulting factory images, and ships
 # nothing.
 
 on:
@@ -16,12 +17,12 @@ on:
   workflow_dispatch:
     inputs:
       wled_ref:
-        description: "Optional WLED tag/ref override. Leave empty to use the latest published WLED release."
+        description: "Optional WLED tag/ref override. Leave empty for the ref pinned in wled_source.json, or 'latest' for the newest published WLED release."
         required: false
         default: ""
         type: string
       wled_patch_prs:
-        description: "Optional wled/WLED pull requests to apply on top of that ref, e.g. 5521 or 5521,5533."
+        description: "Optional wled/WLED pull requests to apply on top of that ref, e.g. 5521 or 5521,5533. Leave empty for the list pinned in wled_source.json, or 'none' for a stock build."
         required: false
         default: ""
         type: string
@@ -71,8 +72,11 @@ jobs:
           fetch-depth: 1
 
       # Before npm and PlatformIO see the tree: a pull request may touch
-      # package-lock.json or platformio.ini. With no pull requests to apply this
-      # echoes the ref back unchanged and touches nothing, so it needs no `if:`.
+      # package-lock.json or platformio.ini. The list comes from
+      # wled_source.json unless the input overrides it, so this rehearsal
+      # carries the same patches a release does. With no pull requests to apply
+      # it echoes the ref back unchanged and touches nothing, so it needs no
+      # `if:`.
       - name: Apply WLED pull requests
         id: wled_patches
         env:

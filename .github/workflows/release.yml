@@ -14,12 +14,12 @@ on:
         default: "main"
         type: string
       wled_ref:
-        description: "Optional WLED tag/ref override. Leave empty to use the latest published WLED release."
+        description: "Optional WLED tag/ref override. Leave empty for the ref pinned in wled_source.json, or 'latest' for the newest published WLED release."
         required: false
         default: ""
         type: string
       wled_patch_prs:
-        description: "Optional wled/WLED pull requests to apply on top of that ref, e.g. 5521 or 5521,5533."
+        description: "Optional wled/WLED pull requests to apply on top of that ref, e.g. 5521 or 5521,5533. Leave empty for the list pinned in wled_source.json, or 'none' for a stock build."
         required: false
         default: ""
         type: string
@@ -114,9 +114,10 @@ jobs:
           path: external/WLED
           fetch-depth: 1
 
-      # Same step, same order as build.yml -- the rehearsal has to see the tree
-      # the release builds. `git apply` is strict on purpose: a patch that no
-      # longer fits the tagged release fails here rather than in the compiler.
+      # Same step, same order as build.yml, and with the same defaults out of
+      # wled_source.json -- the rehearsal has to see the tree the release
+      # builds. `git apply` is strict on purpose: a patch that no longer fits
+      # the tagged release fails here rather than in the compiler.
       - name: Apply WLED pull requests
         id: wled_patches
         env:
