@@ -11,12 +11,13 @@ from scripts.release_staging import stage_environment
 
 # The profiles a release actually builds and publishes.
 #
-# RaceLink_Node_v7_classic_esp32_emac is committed but deliberately absent:
-# its internal-EMAC Ethernet support is still in bring-up and has never been
-# released. The omission is intentional, not an oversight — add it here once
-# Ethernet ships, and note that it is the first classic ESP32 in the set, so
-# its bootloader sits at 0x1000 rather than 0x0 (release_staging.py cross-
-# checks that and will refuse to stage it if the offsets disagree).
+# RaceLink_Node_v7_classic_esp32_emac is not in this repository at all: its
+# internal-EMAC Ethernet support is still in bring-up and has never been
+# released, so there is no profile to ship. When Ethernet does land, adding
+# the profile is not enough -- it has to be named here too, and note that it
+# would be the first classic ESP32 in the set, so its bootloader sits at
+# 0x1000 rather than 0x0 (release_staging.py cross-checks that and will refuse
+# to stage it if the offsets disagree).
 SHIPPING_PROFILE_FILENAMES = (
     "RaceLink_Node_v1_c3_ct62.platformio_override.ini",
     "RaceLink_Node_v3_s2_llcc68.platformio_override.ini",

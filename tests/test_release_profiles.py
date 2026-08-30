@@ -4,6 +4,7 @@ import unittest
 from uuid import uuid4
 
 from scripts.release_profiles import (
+    SHIPPING_PROFILE_FILENAMES,
     is_release_profile,
     iter_shipping_profiles,
     parse_profile_environments,
@@ -11,6 +12,37 @@ from scripts.release_profiles import (
 )
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+class ReadmeProfileListTests(unittest.TestCase):
+    """The readme is where someone picks the profile for their board.
+
+    It listed four of the six shipping profiles for long enough that two
+    boards had no documented way to be built, while naming a `bak_` file as
+    if it were one of them. A list maintained by hand drifts; this is what
+    keeps it honest.
+    """
+
+    def setUp(self):
+        self.readme = (ROOT / "readme.md").read_text(encoding="utf-8")
+
+    def test_every_shipping_profile_is_documented(self):
+        for filename in SHIPPING_PROFILE_FILENAMES:
+            with self.subTest(filename=filename):
+                self.assertIn(filename, self.readme)
+
+    def test_no_profile_is_documented_that_a_release_does_not_build(self):
+        # Naming one is fine -- the readme explains what the two extra files
+        # are -- but not in the list of what a release ships.
+        shipping_list = self.readme.split("Six profiles are built")[1].split(
+            "SHIPPING_PROFILE_FILENAMES"
+        )[0]
+
+        for path in sorted((ROOT / "build_profiles").glob("*.ini")):
+            if path.name in SHIPPING_PROFILE_FILENAMES:
+                continue
+            with self.subTest(filename=path.name):
+                self.assertNotIn(path.name, shipping_list)
 
 
 class ReleaseProfilesTests(unittest.TestCase):

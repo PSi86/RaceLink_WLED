@@ -55,9 +55,11 @@ static const uint16_t NVS_MAGIC = 0xA5C4;  // rf_config_nvs.h uses 0xA5C3
 // reader can tell "not mine" from "mine, but newer than I understand".
 static const uint8_t SCHEMA_VERSION = 1;
 
-// Two, because every shipping profile sets WLED_MAX_BUSSES to 1 or 2.
-// The real per-board cap is checked at apply time; this only bounds the
-// wire struct.
+// Two, because no RaceLink board drives more than two strips. This bounds
+// the wire struct, and in practice it is the binding limit: WLED's own
+// WLED_MAX_BUSSES is derived from the chip's output channels and is
+// comfortably larger on every chip these profiles target.
+// applySeededLedConfig() checks against it regardless.
 static const uint8_t MAX_BUSES = 2;
 
 // Upper bound on a single bus. Not a hardware limit -- WLED's own
