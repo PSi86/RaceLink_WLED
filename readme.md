@@ -60,21 +60,22 @@ The repository currently contains the RaceLink WLED usermod sources plus build-p
 
 ```text
 RaceLink_WLED/
-└─ build_profiles/
-   ├─ RaceLink_Node_v1_c3_ct62.platformio_override.ini
-   ├─ RaceLink_Node_v3_s2_llcc68.platformio_override.ini
-   ├─ RaceLink_Node_v3_s2_llcc68_epaper.platformio_override.ini
-   ├─ RaceLink_Node_v4_s3_llcc68.platformio_override.ini
-   ├─ bak_RaceLink_Node_v3_s2_llcc68.platformio_override.ini
-   └─ all_profiles.platformio_override.ini
-├─ library.json
-├─ wled_source.json
-├─ racelink_epaper.cpp
-├─ racelink_epaper.h
-├─ racelink_proto.h
-├─ racelink_transport_core.h
-├─ racelink_wled.cpp
-├─ racelink_wled.h
+├─ build_profiles/          board profiles, one per hardware variant
+├─ data/                    rf_channels.json, the channel plan the nodes share
+├─ docs/                    design notes for individual features
+├─ scripts/                 release tooling (staging, versioning, WLED patching)
+├─ tests/                   static tests for that tooling
+├─ library.json             PlatformIO manifest for the usermod
+├─ wled_source.json         the pinned WLED ref and upstream patches
+├─ version.json             the RaceLink_WLED release version
+├─ racelink_wled.h/.cpp     the usermod itself
+├─ racelink_proto.h         the RaceLink wire protocol
+├─ racelink_transport_*.h   radio and Ethernet transports
+├─ racelink_w5500_udp.h     W5500 UDP driver for the Ethernet node
+├─ racelink_headless.h      headless-master mode
+├─ racelink_indicators.h    LED feedback patterns
+├─ racelink_epaper.h/.cpp   optional e-paper display support
+├─ *_nvs.h                  persisted LED and radio configuration
 └─ readme.md
 ```
 
@@ -84,14 +85,24 @@ This layout combines the usermod source itself with the hardware-specific Platfo
 
 ## Supported hardware profiles
 
-The repository currently includes the following build profiles:
+Six profiles are built and published by every release:
 
 - `RaceLink_Node_v1_c3_ct62.platformio_override.ini`
 - `RaceLink_Node_v3_s2_llcc68.platformio_override.ini`
 - `RaceLink_Node_v3_s2_llcc68_epaper.platformio_override.ini`
 - `RaceLink_Node_v4_s3_llcc68.platformio_override.ini`
-- `bak_RaceLink_Node_v3_s2_llcc68.platformio_override.ini`
-- `all_profiles.platformio_override.ini`
+- `RaceLink_Node_v5_s3_eth.platformio_override.ini`
+- `RaceLink_Node_v6_s3_heltec_wpaper.platformio_override.ini`
+
+That list is `SHIPPING_PROFILE_FILENAMES` in `scripts/release_profiles.py`; a
+profile that is not named there is not built, whatever else it is.
+
+Two more files in the directory are not shipping profiles:
+
+- `all_profiles.platformio_override.ini` — every environment in one file, for
+  building several variants from a single checkout.
+- `bak_RaceLink_Node_v3_s2_llcc68.platformio_override.ini` — a kept-around
+  earlier revision of the v3 profile.
 
 These profiles contain the required compile-time configuration for the currently supported RaceLink node hardware.
 

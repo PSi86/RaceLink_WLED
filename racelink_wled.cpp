@@ -1452,9 +1452,13 @@ void UsermodRaceLink::applySeededLedConfig() {
   LedConfigNvs::P_LedConfig cfg{};
   if (!LedConfigNvs::load(cfg)) return;
 
-  // WLED_MAX_BUSSES is per profile — 1 on the C3 node, 2 everywhere else.
-  // A seed asking for more is clamped rather than rejected: one working
-  // strip is a better outcome than falling back to the compile default.
+  // WLED_MAX_BUSSES is not the number a profile asks for: const.h #undefs any
+  // build-flag value and derives it from the chip's RMT, I2S and LEDC output
+  // channels, so it is 8 on the C3 and larger still on S2/S3. What actually
+  // bounds a seed is LedConfigNvs::MAX_BUSES, enforced by the wire struct
+  // before the payload gets here; the check below is belt and braces. It
+  // clamps rather than rejects: one working strip is a better outcome than
+  // falling back to the compile default.
   uint8_t busCount = cfg.bus_count;
   if (busCount > WLED_MAX_BUSSES) {
     DEBUG_PRINTF_P(PSTR("[RaceLink] LED seed wants %u bus(es), this build supports %u\n"),
