@@ -86,6 +86,23 @@ class ArtifactStagingTests(unittest.TestCase):
             with self.subTest(gone=gone):
                 self.assertNotIn(gone, source)
 
+    def test_both_workflows_default_to_the_committed_source_pin(self):
+        # The whole point of the pin: a rehearsal that resolves its own ref and
+        # carries no patches rehearses a tree no release ever ships. Leaving
+        # both inputs blank has to mean "what wled_source.json says", and the
+        # descriptions are where an operator finds that out.
+        for workflow in (BUILD_WORKFLOW, RELEASE_WORKFLOW):
+            with self.subTest(workflow=workflow.name):
+                descriptions = [
+                    line
+                    for line in workflow.read_text(encoding="utf-8").splitlines()
+                    if line.strip().startswith("description:")
+                    and ("WLED tag/ref" in line or "pull requests to apply" in line)
+                ]
+                self.assertEqual(len(descriptions), 2)
+                for description in descriptions:
+                    self.assertIn("wled_source.json", description)
+
     def test_both_workflows_can_apply_upstream_pull_requests(self):
         for workflow in (BUILD_WORKFLOW, RELEASE_WORKFLOW):
             with self.subTest(workflow=workflow.name):
@@ -151,10 +168,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             source,
         )
         self.assertIn('description: "Branch to release from"', source)
-        self.assertIn(
-            'description: "Optional WLED tag/ref override. Leave empty to use the latest published WLED release."',
-            source,
-        )
+        self.assertIn("Optional WLED tag/ref override.", source)
 
     def test_release_workflow_resolves_versions_guards_duplicates_and_publishes_release(self):
         source = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")

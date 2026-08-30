@@ -68,6 +68,7 @@ RaceLink_WLED/
    ├─ bak_RaceLink_Node_v3_s2_llcc68.platformio_override.ini
    └─ all_profiles.platformio_override.ini
 ├─ library.json
+├─ wled_source.json
 ├─ racelink_epaper.cpp
 ├─ racelink_epaper.h
 ├─ racelink_proto.h
@@ -112,10 +113,11 @@ Before building, make sure you have:
 
 ### 1. Get the official WLED repository
 
-Clone or download the official WLED repository:
+Clone or download the official WLED repository, at the release this firmware is
+built against (see **Which WLED version** below):
 
 ```bash
-git clone https://github.com/wled/WLED.git
+git clone --branch v16.0.1 https://github.com/wled/WLED.git
 ```
 
 You can also fork it on GitHub first and then clone your fork.
@@ -179,6 +181,45 @@ The provided build profiles currently define hardware-specific values such as:
 - optional e-paper display pin mapping
 
 This means that users should **start with the closest matching profile** and then adjust it if their hardware differs.
+
+---
+
+## Which WLED version
+
+`wled_source.json` names the WLED sources a RaceLink image is built from:
+
+```json
+{
+  "ref": "v16.0.1",
+  "patch_prs": [5521]
+}
+```
+
+* `ref` — the wled/WLED tag to build against, or `"latest"` to resolve the
+  newest published upstream release at build time.
+* `patch_prs` — upstream pull requests applied on top of that tag, in order.
+  `git apply` is strict here: a patch that no longer fits the tag fails the
+  build rather than being fuzzed into place.
+
+Both the compile-only build and the release read this file, so a pull request
+is compiled against the same tree a release would ship. Both workflows still
+take a `wled_ref` and a `wled_patch_prs` input for a one-off run; leaving them
+empty uses the pinned values, and `latest` / `none` are the ways to ask for
+something else explicitly.
+
+Pinning is deliberate. Every build profile inherits its platform, toolchain and
+NeoPixelBus version from WLED's shared `[esp32]`, `[esp32s2]`, `[esp32s3]` and
+`[esp32c3]` sections. On WLED's `main` those sections have already moved from
+ESP-IDF 4.4 to 5.5, so an unpinned build would adopt a new toolchain — and a
+different OTA story — the day the next WLED release appears, with no commit
+here to point at.
+
+`patch_prs` currently carries **wled/WLED#5521**, which exports the battery
+usermod's readings through `um_data`. Without it `getUMData(USERMOD_ID_BATTERY)`
+never succeeds and a node reports no battery state; nothing fails, the lookup is
+simply retried forever. The pull request is still open upstream, and
+wled/WLED#5399 rewrites the same file — once that merges, this patch stops
+applying and the dependency needs another answer.
 
 ---
 

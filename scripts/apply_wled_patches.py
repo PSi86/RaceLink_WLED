@@ -18,6 +18,13 @@ patched tree that reports a bare ``v16.0.1`` would claim to be a stock release
 build. :func:`label_ref` appends the pull requests so the sidecar names every
 source that went into the image.
 
+Which pull requests those are comes from ``wled_source.json``, not from a
+field somebody types on release day. A patch list that lives only in a
+``workflow_dispatch`` input is carried by no rehearsal and by whichever release
+its operator remembered it for -- and #5521 in particular fails silently when
+it is missed, because the battery data it exports is looked up at runtime and
+merely retried when absent. Passing ``none`` builds a stock tag anyway.
+
 With no pull requests to apply this is a pass-through: the ref is echoed
 unchanged and the tree is untouched, so the workflows need no conditional
 around it.
@@ -31,6 +38,12 @@ import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.wled_source import NO_PATCHES, load_source_pin
 
 WLED_REPOSITORY = "wled/WLED"
 DEFAULT_USER_AGENT = "RaceLink_WLED-release-resolver"
@@ -60,9 +73,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--patch-prs",
         default="",
-        help="Pull requests to apply, separated by commas or whitespace. May be empty.",
+        help=(
+            "Pull requests to apply, separated by commas or whitespace. If "
+            "empty, apply the list pinned in wled_source.json; "
+            f"'{NO_PATCHES}' applies none."
+        ),
     )
     return parser.parse_args()
+
+
+def resolve_pr_numbers(raw: str, *, pinned: str | None = None) -> list[int]:
+    """Resolve the list to apply from the input, or from the pin file."""
+    requested = str(raw).strip()
+    # An empty input is the workflow field nobody filled in, not a decision to
+    # build unpatched -- that one has to be said out loud.
+    if not requested:
+        requested = pinned if pinned is not None else load_source_pin().patch_prs
+    if requested.strip().lower() == NO_PATCHES:
+        return []
+    return parse_pr_numbers(requested)
 
 
 def parse_pr_numbers(raw: str) -> list[int]:
@@ -132,7 +161,7 @@ def main() -> int:
     label = apply_pull_requests(
         wled_dir=args.wled_dir.resolve(),
         ref=args.wled_ref,
-        pr_numbers=parse_pr_numbers(args.patch_prs),
+        pr_numbers=resolve_pr_numbers(args.patch_prs),
     )
     sys.stdout.write(f"{label}\n")
     return 0
